@@ -1,70 +1,250 @@
-import base64
+import time
 import json
-import requests
-from fastapi import FastAPI, Request
+import httpx
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 
 app = FastAPI()
 
-# Вставьте ваш API ключ от Google AI Studio / Gemini / Ollama
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
+# Временное хранилище сессий в памяти (аналог Map() в воркере)
+sessions = {}
 
-@app.get("/")
+def cleanup_sessions():
+    now = time.time() * 1000
+    expired = [sid for sid, sess in sessions.items() if now - sess["timestamp"] > 120000]
+    for sid in expired:
+        del sessions[sid]
+
+@app.api_route("/", methods=["GET", "POST"])
 def home():
-    return PlainTextResponse("Omega J2ME Proxy Relay is Running!")
+    return PlainTextResponse("Omega Render Proxy Active.")
 
-@app.api_route("/api/chat", methods=["GET", "POST"])
+@app.api_route("/api/chat", methods=["POST"])
 async def handle_chat(request: Request):
-    # 1. Забираем метаданные из URL (системный промпт, история)
-    params = dict(request.query_params)
-    sys_prompt = params.get("sys", "You are Omega AI helper for J2ME.")
-    history_raw = params.get("history", "")
+    cleanup_sessions()
     
-    # 2. Читаем body (Base64 чанки изображения или текст)
-    body_bytes = await request.body()
-    body_str = body_bytes.decode("utf-8", errors="ignore")
+    url_params = dict(request.query_params)
+    sid = url_params.get("sid")
     
-    user_prompt = params.get("prompt", body_str if not body_str.startswith("DATA:") else "Опиши это изображение.")
+    if not sid:
+        return PlainTextResponse("ERR: Missing session ID (sid)", status_code=400)
     
-    # 3. Собираем запрос к Gemini 1.5 Flash / 2.0
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
-    contents = []
-    
-    # Добавляем системный контекст
-    if sys_prompt:
-        contents.append({"role": "user", "parts": [{"text": f"System Instruction: {sys_prompt}"}]})
-        contents.append({"role": "model", "parts": [{"text": "Understood."}]})
+    try:
+        chat_type = url_params.get("type", "image")
+        chunk_index = int(url_params.get("chunk", 1))
+        total_chunks = int(url_params.get("total", 1))
+        is_final = url_params.get("final") == "1"
+        
+        prov = int(url_params.get("prov", 1))
+        model = url_params.get("model", "gpt-4o-mini")
+        api_key = url_params.get("key", "")
+        prompt = url_params.get("prompt", "")
+        system_prompt = url_params.get("sys", "")
+        history_str = url_params.get("history", "")
+        
+        chunk_data = (await request.body()).decode("utf-8", errors="ignore")
+        
+        sess = sessions.get(sid)
+        if not sess:
+            sess = {
+                "chunks": [None] * total_chunks,
+                "total": total_chunks,
+                "receivedCount": 0,
+                "timestamp": time.time() * 1000,
+                "prov": prov,
+                "model": model,
+                "apiKey": api_key,
+                "prompt": prompt,
+                "systemPrompt": system_prompt,
+                "historyStr": history_str,
+                "type": chat_type
+            }
+            sessions[sid] = sess
+            
+        if history_str:
+            sess["historyStr"] = history_str
+        if system_prompt:
+            sess["systemPrompt"] = system_prompt
+        if prompt:
+            sess["prompt"] = prompt
+            
+        if 0 <= (chunk_index - 1) < len(sess["chunks"]):
+            if sess["chunks"][chunk_index - 1] is None:
+                sess["chunks"][chunk_index - 1] = chunk_data
+                sess["receivedCount"] += 1
+                
+        sess["timestamp"] = time.time() * 1000
+        
+        if sess["receivedCount"] >= sess["total"] or is_final:
+            full_payload = "".join([c for c in sess["chunks"] if c is not None])
+            del sessions[sid]
+            
+            if sess["type"] == "image":
+                ai_response = await send_image_to_neural_network(
+                    sess["prov"], sess["model"], sess["apiKey"], 
+                    sess["prompt"], sess["systemPrompt"], sess["historyStr"], full_payload
+                )
+            else:
+                ai_response = await send_chat_to_neural_network(
+                    sess["prov"], sess["model"], sess["apiKey"], 
+                    sess["systemPrompt"], full_payload
+                )
+                
+            return PlainTextResponse(ai_response, media_type="text/plain; charset=utf-8")
+            
+        return PlainTextResponse("CHUNK_OK", media_type="text/plain; charset=utf-8")
+        
+    except Exception as err:
+        if sid in sessions:
+            del sessions[sid]
+        return PlainTextResponse(f"ERR: {str(err)}", status_code=500, media_type="text/plain; charset=utf-8")
 
-    # Если передана картинка в Base64
-    if body_str.startswith("DATA:"):
-        base64_data = body_str.split("DATA:")[1]
+async def send_image_to_neural_network(prov, model, apiKey, prompt, systemPrompt, historyStr, base64Img):
+    headers = {"Content-Type": "application/json"}
+    history = []
+    if historyStr:
+        try:
+            history = json.loads(historyStr)
+        except:
+            pass
+
+    if prov == 0:
+        endpoint = "https://ollama.com/api/generate"
+        if apiKey:
+            headers["Authorization"] = f"Bearer {apiKey}"
+        prompt_text = ""
+        for msg in history:
+            role_name = "User" if msg.get("role") == "user" else "Assistant"
+            prompt_text += f"{role_name}: {msg.get('content', '')}\n"
+        prompt_text += f"User: {prompt}\nAssistant:"
+        payload = {"model": model, "prompt": prompt_text, "images": [base64Img], "stream": False}
+        if systemPrompt:
+            payload["system"] = systemPrompt
+
+    elif prov == 4:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={apiKey}"
+        contents = []
+        for m in history:
+            r = "model" if m.get("role") == "assistant" else "user"
+            contents.append({"role": r, "parts": [{"text": m.get("content", "")}]})
         contents.append({
             "role": "user",
             "parts": [
-                {"text": user_prompt},
-                {
-                    "inline_data": {
-                        "mime_type": "image/jpeg",
-                        "data": base64_data
-                    }
-                }
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": base64Img}}
             ]
         })
-    else:
-        contents.append({"role": "user", "parts": [{"text": user_prompt}]})
+        payload = {"contents": contents}
+        if systemPrompt:
+            payload["system_instruction"] = {"parts": [{"text": systemPrompt}]}
 
-    payload = {"contents": contents}
-    
+    else:
+        if prov == 1:
+            endpoint = "https://api.voidai.app/v1/chat/completions"
+        elif prov == 2:
+            endpoint = "https://opencodezen.com/api/v1/chat/completions"
+        elif prov == 3:
+            endpoint = "https://api.navyai.ru/v1/chat/completions"
+        else:
+            endpoint = "https://api.voidai.app/v1/chat/completions"
+
+        if apiKey:
+            headers["Authorization"] = f"Bearer {apiKey}"
+        messages = []
+        if systemPrompt:
+            messages.append({"role": "system", "content": systemPrompt})
+        messages.extend(history)
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64Img}"}}
+            ]
+        })
+        payload = {"model": model, "messages": messages, "stream": False}
+
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        res = await client.post(endpoint, headers=headers, json=payload)
+        raw_text = res.text
+        if raw_text.strip().startswith("<"):
+            raise Exception(f"Provider returned HTML error (HTTP {res.status_code})")
+        try:
+            data = res.json()
+        except:
+            raise Exception(f"Invalid JSON from provider: {raw_text[:100]}")
+        if "error" in data:
+            err_val = data["error"]
+            raise Exception(err_val if isinstance(err_val, str) else json.dumps(err_val))
+
+        if prov == 4:
+            return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Sys: Empty Gemini response")
+        if prov == 0:
+            return data.get("response") or data.get("message", {}).get("content", "Sys: Empty Ollama response")
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "Sys: Empty OpenAI-like response")
+
+async def send_chat_to_neural_network(prov, model, apiKey, systemPrompt, historyJsonStr):
+    headers = {"Content-Type": "application/json"}
     try:
-        resp = requests.post(url, json=payload, timeout=30)
-        data = resp.json()
-        
-        # Извлекаем ответ модели
-        answer = data["candidates"][0]["content"]["parts"][0]["text"]
-        
-        # Отдаем чистый plain text для J2ME без лишнего JSON-мусора
-        return PlainTextResponse(answer.strip())
-        
-    except Exception as e:
-        return PlainTextResponse(f"Proxy Error: {str(e)}", status_code=500)
+        history = json.loads(historyJsonStr)
+    except:
+        history = []
+
+    if prov == 0:
+        endpoint = "https://ollama.com/api/generate"
+        if apiKey:
+            headers["Authorization"] = f"Bearer {apiKey}"
+        prompt_text = ""
+        for msg in history:
+            role_name = "User" if msg.get("role") == "user" else "Assistant"
+            prompt_text += f"{role_name}: {msg.get('content', '')}\n"
+        prompt_text += "Assistant:"
+        payload = {"model": model, "prompt": prompt_text, "stream": False}
+        if systemPrompt:
+            payload["system"] = systemPrompt
+
+    elif prov == 4:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={apiKey}"
+        contents = []
+        for m in history:
+            r = "model" if m.get("role") == "assistant" else "user"
+            contents.append({"role": r, "parts": [{"text": m.get("content", "")}]})
+        payload = {"contents": contents}
+        if systemPrompt:
+            payload["system_instruction"] = {"parts": [{"text": systemPrompt}]}
+
+    else:
+        if prov == 1:
+            endpoint = "https://api.voidai.app/v1/chat/completions"
+        elif prov == 2:
+            endpoint = "https://opencodezen.com/api/v1/chat/completions"
+        elif prov == 3:
+            endpoint = "https://api.navyai.ru/v1/chat/completions"
+        else:
+            endpoint = "https://api.voidai.app/v1/chat/completions"
+
+        if apiKey:
+            headers["Authorization"] = f"Bearer {apiKey}"
+        messages = []
+        if systemPrompt:
+            messages.append({"role": "system", "content": systemPrompt})
+        messages.extend(history)
+        payload = {"model": model, "messages": messages, "stream": False}
+
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        res = await client.post(endpoint, headers=headers, json=payload)
+        raw_text = res.text
+        if raw_text.strip().startswith("<"):
+            raise Exception(f"Provider returned HTML error (HTTP {res.status_code})")
+        try:
+            data = res.json()
+        except:
+            raise Exception(f"Invalid JSON from provider: {raw_text[:100]}")
+        if "error" in data:
+            err_val = data["error"]
+            raise Exception(err_val if isinstance(err_val, str) else json.dumps(err_val))
+
+        if prov == 4:
+            return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Sys: Empty Gemini response")
+        if prov == 0:
+            return data.get("response") or data.get("message", {}).get("content", "Sys: Empty Ollama response")
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "Sys: Empty OpenAI-like response")
