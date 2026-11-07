@@ -4,6 +4,7 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 
+
 app = FastAPI()
 
 # Временное хранилище сессий в памяти (аналог Map() в воркере)
