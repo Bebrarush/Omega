@@ -13,7 +13,7 @@ GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
 def home():
     return PlainTextResponse("Omega J2ME Proxy Relay is Running!")
 
-@app.all("/api/chat")
+@app.api_route("/api/chat", methods=["GET", "POST"])
 async def handle_chat(request: Request):
     # 1. Забираем метаданные из URL (системный промпт, история)
     params = dict(request.query_params)
