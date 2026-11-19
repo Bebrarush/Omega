@@ -1,3 +1,7 @@
+#Run this script directly or run it from the command line
+#in the same folder where Omega.java is located.
+
+
 import os
 import subprocess
 import urllib.request
