@@ -112,6 +112,7 @@ protected void startApp() {
             } else {
                 safeSetCurrent(configCanvas);
             }
+            startAutoUpdate();
         }
     }).start();
 }
@@ -508,6 +509,397 @@ private void openFallbackBox() {
     });
     safeSetCurrent(tb);
 }
+
+private String updRepo = "Bebrarush/Omega";
+private int updSrc = 0;                  // 0: файлы релиза на GitHub (Releases), 1: файлы в репозитории (raw)
+private String updTag = "";              // тег релиза; пусто = последний (latest)
+private String updBranch = "main";
+private String updFolder = "";
+private String updName = "";
+private boolean updAuto = true;
+private boolean updLoaded = false;
+private String updStatus = "not checked yet";
+private String updRemote = "";
+private boolean updAvail = false;
+private boolean updBusy = false;
+private boolean updAutoDone = false;
+private String updErr = "";
+ 
+// Версия установленного приложения из JAD/манифеста
+private String updInstalled() {
+    String v = getAppProperty("MIDlet-Version");
+    return (v == null || v.trim().length() == 0) ? "?" : v.trim();
+}
+ 
+// Оставляет в строке только допустимые символы: буквы, цифры, _ . - и при необходимости /
+private String updClean(String s, boolean slash) {
+    if (s == null) return "";
+    StringBuffer sb = new StringBuffer();
+    for (int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' || (slash && c == '/')) sb.append(c);
+    }
+    String r = sb.toString();
+    while (r.startsWith("/")) r = r.substring(1);
+    while (r.endsWith("/")) r = r.substring(0, r.length() - 1);
+    return r;
+}
+ 
+// Имя файла по умолчанию: берётся из адреса JAR, с которого приложение установлено (так отличаются сборки вроде Omega_s40_fix)
+private String updGuessName() {
+    String u = getAppProperty("MIDlet-Jar-URL");
+    if (u == null) return "Omega";
+    int q = u.indexOf('?');
+    if (q >= 0) u = u.substring(0, q);
+    int sl = u.lastIndexOf('/');
+    if (sl >= 0) u = u.substring(sl + 1);
+    sl = u.lastIndexOf('\\');
+    if (sl >= 0) u = u.substring(sl + 1);
+    if (u.toLowerCase().endsWith(".jar")) u = u.substring(0, u.length() - 4);
+    u = updClean(u, false);
+    return u.length() == 0 ? "Omega" : u;
+}
+ 
+private void loadUpd() {
+    if (updLoaded) return;
+    updLoaded = true;
+    updName = updGuessName();
+    RecordStore rs = null;
+    try {
+        rs = RecordStore.openRecordStore("OmegaUpdate", false);
+        if (rs.getNumRecords() > 0) {
+            String d = new String(rs.getRecord(1), "UTF-8");
+            String[] f = new String[7];
+            int n = 0, st = 0;
+            for (int i = 0; i <= d.length() && n < 7; i++) {
+                if (i == d.length() || d.charAt(i) == '\n') { f[n++] = d.substring(st, i); st = i + 1; }
+            }
+            if (n == 7) {
+                updSrc = f[5].equals("1") ? 1 : 0;
+                updTag = updClean(f[6], false);
+                String r = updClean(f[0], true);
+                if (r.indexOf('/') > 0) updRepo = r;
+                String b = updClean(f[1], true);
+                if (b.length() > 0) updBranch = b;
+                updFolder = updClean(f[2], true);
+                String nm = updClean(f[3], false);
+                if (nm.length() > 0) updName = nm;
+                updAuto = !f[4].equals("0");
+            }
+        }
+    } catch (Exception e) {}
+    finally { if (rs != null) try { rs.closeRecordStore(); } catch (Exception e) {} }
+}
+ 
+private void saveUpd() {
+    RecordStore rs = null;
+    try { RecordStore.deleteRecordStore("OmegaUpdate"); } catch (Exception e) {}
+    try {
+        rs = RecordStore.openRecordStore("OmegaUpdate", true);
+        byte[] b = (updRepo + "\n" + updBranch + "\n" + updFolder + "\n" + updName + "\n" + (updAuto ? "1" : "0") + "\n" + updSrc + "\n" + updTag).getBytes("UTF-8");
+        rs.addRecord(b, 0, b.length);
+    } catch (Exception e) {}
+    finally { if (rs != null) try { rs.closeRecordStore(); } catch (Exception e) {} }
+}
+ 
+// Через прокси ходим только когда он включён для всего; иначе телефон стучится в GitHub напрямую
+private boolean updUseProxy() {
+    return proxyMode == 2 && proxyUrl != null && proxyUrl.trim().length() > 0;
+}
+ 
+private String updProxyBase() {
+    String b = proxyUrl.trim();
+    if (b.endsWith("/")) b = b.substring(0, b.length() - 1);
+    return b;
+}
+ 
+private String updQuery() {
+    return "repo=" + escapeUrl(updRepo) + "&src=" + (updSrc == 1 ? "raw" : "release") + "&tag=" + escapeUrl(updTag) + "&branch=" + escapeUrl(updBranch) + "&folder=" + escapeUrl(updFolder) + "&name=" + escapeUrl(updName);
+}
+ 
+private String updDirectUrl(String ext) {
+    if (updSrc == 0) {
+        if (updTag.length() == 0) return "https://github.com/" + updRepo + "/releases/latest/download/" + updName + ext;
+        return "https://github.com/" + updRepo + "/releases/download/" + updTag + "/" + updName + ext;
+    }
+    String u = "https://raw.githubusercontent.com/" + updRepo + "/" + updBranch + "/";
+    if (updFolder.length() > 0) u += updFolder + "/";
+    return u + updName + ext;
+}
+ 
+// Адрес, который откроет браузер для установки: JAR напрямую с GitHub или через прокси
+private String updInstallUrl() {
+    if (updUseProxy()) return updProxyBase() + "/" + updName + ".jar?type=jar&" + updQuery();
+    return updDirectUrl(".jar");
+}
+ 
+// Небольшой текстовый GET с переходами по редиректам. null при ошибке, причина в updErr
+private String updHttpGet(String url) {
+    for (int hop = 0; hop < 4; hop++) {
+        HttpConnection c = null;
+        InputStream is = null;
+        try {
+            c = (HttpConnection) Connector.open(url, Connector.READ);
+            c.setRequestMethod(HttpConnection.GET);
+            c.setRequestProperty("User-Agent", "Omega-Symbian");
+            c.setRequestProperty("Connection", "close");
+            int rc = c.getResponseCode();
+            if (rc == 301 || rc == 302 || rc == 303 || rc == 307 || rc == 308) {
+                String loc = c.getHeaderField("Location");
+                if (loc == null || loc.length() == 0) { updErr = "bad redirect"; return null; }
+                url = loc;
+                continue;
+            }
+            if (rc != 200) { updErr = "HTTP " + rc; return null; }
+            is = c.openInputStream();
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[512];
+            int n;
+            while ((n = is.read(buf)) != -1) {
+                bo.write(buf, 0, n);
+                if (bo.size() > 16384) break;
+            }
+            return new String(bo.toByteArray(), "UTF-8");
+        } catch (Exception e) {
+            String m = String.valueOf(e);
+            if (m.length() > 40) m = m.substring(0, 40);
+            updErr = "network: " + m;
+            return null;
+        } finally {
+            try { if (is != null) is.close(); } catch (Exception e) {}
+            try { if (c != null) c.close(); } catch (Exception e) {}
+        }
+    }
+    updErr = "too many redirects";
+    return null;
+}
+ 
+// Значение строки "Ключ: значение" из JAD или манифеста
+private String updJadValue(String jad, String key) {
+    int i = 0, len = jad.length();
+    while (i < len) {
+        int e = jad.indexOf('\n', i);
+        if (e < 0) e = len;
+        String line = jad.substring(i, e).trim();
+        int c = line.indexOf(':');
+        if (c > 0 && line.substring(0, c).trim().equalsIgnoreCase(key)) return line.substring(c + 1).trim();
+        i = e + 1;
+    }
+    return "";
+}
+ 
+// Числа из строки версии: "1.2.10" -> {1,2,10,0,0,0}
+private int[] updNums(String v) {
+    int[] r = new int[6];
+    int idx = 0, cur = -1;
+    for (int i = 0; i <= v.length() && idx < 6; i++) {
+        char c = (i < v.length()) ? v.charAt(i) : ' ';
+        if (c >= '0' && c <= '9') {
+            cur = (cur < 0 ? 0 : cur) * 10 + (c - '0');
+            if (cur > 100000) cur = 100000;
+        } else if (cur >= 0) {
+            r[idx++] = cur;
+            cur = -1;
+        }
+    }
+    return r;
+}
+ 
+// Больше нуля, если версия a новее версии b
+private int updCompare(String a, String b) {
+    int[] x = updNums(a), y = updNums(b);
+    for (int i = 0; i < 6; i++) {
+        if (x[i] != y[i]) return x[i] > y[i] ? 1 : -1;
+    }
+    return 0;
+}
+ 
+// Синхронная проверка: обновляет updStatus, updRemote, updAvail. Вызывать из фонового потока
+private void updCheckCore() {
+    synchronized (this) {
+        if (updBusy) return;
+        updBusy = true;
+    }
+    try {
+        loadUpd();
+        updAvail = false;
+        updErr = "";
+        String jad;
+        if (updUseProxy()) {
+            String r = updHttpGet(updProxyBase() + "/?type=update&" + updQuery());
+            if (r == null) jad = null;
+            else if (r.startsWith("OK")) jad = r.substring(2);
+            else { updErr = r.trim(); if (updErr.length() > 40) updErr = updErr.substring(0, 40); jad = null; }
+        } else {
+            jad = updHttpGet(updDirectUrl(".jad"));
+        }
+        if (jad == null) {
+            updStatus = "error: " + updErr;
+            if (!updUseProxy() && updErr.startsWith("network")) updStatus += " (try proxy: FOR EVERYTHING)";
+            return;
+        }
+        String rv = updJadValue(jad, "MIDlet-Version");
+        if (rv.length() == 0) { updStatus = "no MIDlet-Version in JAD"; return; }
+        updRemote = rv;
+        if (updCompare(rv, updInstalled()) > 0) {
+            updAvail = true;
+            updStatus = "new version v" + rv;
+        } else {
+            updStatus = "up to date (v" + rv + ")";
+        }
+    } catch (Exception e) {
+        updStatus = "error: " + e;
+    } finally {
+        updBusy = false;
+    }
+}
+ 
+// Проверка при запуске, если включена в настройках: в фоне, и коротким окошком сообщает, если есть новая версия
+public void startAutoUpdate() {
+    loadUpd();
+    if (!updAuto || updAutoDone) return;
+    updAutoDone = true;
+    new Thread(new Runnable() {
+        public void run() {
+            try { Thread.sleep(5000); } catch (Exception e) {}
+            updCheckCore();
+            if (!updAvail) return;
+            display.callSerially(new Runnable() {
+                public void run() {
+                    Displayable cur = display.getCurrent();
+                    if (cur == null) return;
+                    Alert al = new Alert("Update", "New version v" + updRemote + " is available. Open Params, then UPDATE to install.", null, AlertType.INFO);
+                    al.setTimeout(6000);
+                    display.setCurrent(al, cur);
+                }
+            });
+        }
+    }).start();
+}
+ 
+private Vector updItems() {
+    Vector it = new Vector();
+    it.addElement(updBusy ? "[CHECKING...]" : "[CHECK NOW]");
+    it.addElement(updAvail ? "[INSTALL v" + updRemote + "]" : "[STATUS: " + updStatus + "]");
+    it.addElement("[INSTALLED: v" + updInstalled() + "]");
+    it.addElement("[SOURCE: " + (updSrc == 0 ? "RELEASES" : "REPO FILES") + "]");
+    it.addElement("[REPO: " + updRepo + "]");
+    it.addElement("[TAG: " + (updTag.length() == 0 ? "latest" : updTag) + "]");
+    it.addElement("[BRANCH: " + updBranch + (updSrc == 0 ? " (unused)" : "") + "]");
+    it.addElement("[FOLDER: " + (updFolder.length() == 0 ? "(root)" : updFolder) + (updSrc == 0 ? " (unused)" : "") + "]");
+    it.addElement("[FILE: " + updName + ".jar]");
+    it.addElement("[AUTO CHECK: " + (updAuto ? "ON" : "OFF") + "]");
+    it.addElement("[VIA: " + (updUseProxy() ? "PROXY" : "DIRECT") + "]");
+    return it;
+}
+ 
+private SelectCallback updCallback() {
+    return new SelectCallback() {
+        public void onSelected(int index, String value) {
+            if (index == 0) {
+                if (!updBusy) {
+                    updStatus = "checking...";
+                    updAvail = false;
+                    openUpdateMenu(0);
+                    updCheckAsync();
+                } else {
+                    openUpdateMenu(0);
+                }
+            } else if (index == 1) {
+                if (updAvail) updAskInstall();
+                else openUpdateMenu(1);
+            } else if (index == 2) {
+                openUpdateMenu(2);
+            } else if (index == 3) {
+                updSrc = 1 - updSrc;
+                updAvail = false;
+                updStatus = "not checked yet";
+                saveUpd();
+                openUpdateMenu(3);
+            } else if (index >= 4 && index <= 8) {
+                openUpdText(index);
+            } else if (index == 9) {
+                updAuto = !updAuto;
+                saveUpd();
+                openUpdateMenu(9);
+            } else if (index == 10) {
+                openProxyConfigMenu();
+            }
+        }
+    };
+}
+ 
+public void openUpdateMenu(int sel) {
+    loadUpd();
+    openSelectionMenu("Update", updItems(), sel, updCallback(), new Runnable() { public void run() { openParamsMenu(11); } });
+}
+ 
+// Проверка в фоне; по окончании меню обновляется, если пользователь никуда не ушёл
+private void updCheckAsync() {
+    final int tok = beginAsyncNav();
+    new Thread(new Runnable() {
+        public void run() {
+            updCheckCore();
+            openSelectionMenuIf(tok, "Update", updItems(), updAvail ? 1 : 0, updCallback(), new Runnable() { public void run() { openParamsMenu(11); } });
+        }
+    }).start();
+}
+ 
+private void updAskInstall() {
+    Vector it = new Vector();
+    it.addElement("[YES: OPEN DOWNLOAD IN BROWSER]");
+    it.addElement("[NO]");
+    openSelectionMenu("Install v" + updRemote + "?", it, 1, new SelectCallback() {
+        public void onSelected(int index, String value) {
+            if (index == 0) updInstall();
+            else openUpdateMenu(1);
+        }
+    }, new Runnable() { public void run() { openUpdateMenu(1); } });
+}
+ 
+// Установка: браузер или системный установщик скачивает JAR и предлагает установить
+private void updInstall() {
+    boolean mustExit = false;
+    try {
+        mustExit = platformRequest(updInstallUrl());
+        updStatus = "download opened";
+    } catch (ConnectionNotFoundException e) {
+        updStatus = "cannot open browser";
+    } catch (Exception e) {
+        updStatus = "error: " + e;
+    }
+    if (mustExit) {
+        destroyApp(true);
+        notifyDestroyed();
+        return;
+    }
+    openUpdateMenu(1);
+}
+ 
+private void openUpdText(final int idx) {
+    String title = (idx == 4) ? "Repo (owner/name)" : (idx == 5 ? "Release tag (empty = latest)" : (idx == 6 ? "Branch" : (idx == 7 ? "Folder (empty = root)" : "File name without extension")));
+    String cur = (idx == 4) ? updRepo : (idx == 5 ? updTag : (idx == 6 ? updBranch : (idx == 7 ? updFolder : updName)));
+    final TextBox tb = new TextBox(title, cur, 100, TextField.ANY);
+    tb.addCommand(new Command("OK", Command.OK, 1));
+    tb.addCommand(new Command("Cancel", Command.CANCEL, 2));
+    tb.setCommandListener(new CommandListener() {
+        public void commandAction(Command c, Displayable d) {
+            if (c.getLabel().equals("OK")) {
+                String v = updClean(tb.getString(), idx == 4 || idx == 6 || idx == 7);
+                if (idx == 4) { if (v.indexOf('/') > 0 && v.indexOf('/') == v.lastIndexOf('/') && !v.endsWith("/")) updRepo = v; }
+                else if (idx == 5) updTag = v;
+                else if (idx == 6) { if (v.length() > 0) updBranch = v; }
+                else if (idx == 7) updFolder = v;
+                else if (v.length() > 0) updName = v;
+                updAvail = false;
+                updStatus = "not checked yet";
+                saveUpd();
+            }
+            openUpdateMenu(idx);
+        }
+    });
+    safeSetCurrent(tb);
+}
  
 public void openParamsMenu(int sel) {
     loadParams();
@@ -523,6 +915,7 @@ public void openParamsMenu(int sel) {
     items.addElement("[TYPE DELAY: " + streamDelay + " ms]");
     items.addElement("[CONTEXT: " + (ctxLimit == 0 ? "ALL" : ctxLimit + " chars") + "]");
     items.addElement("[OPENROUTER FALLBACK: " + (fallbackModels.length() == 0 ? "OFF" : "SET") + "]");
+    items.addElement("[UPDATE: v" + updInstalled() + "]");
  
     openSelectionMenu("Generation Params", items, sel, new SelectCallback() {
         public void onSelected(int index, String value) {
@@ -540,6 +933,8 @@ public void openParamsMenu(int sel) {
                 openStreamValueBox(index);
             } else if (index == 10) {
                 openFallbackBox();
+            } else if (index == 11) {
+                openUpdateMenu(0);
             }
         }
     }, new Runnable() { public void run() { switchToConfig(); } });
@@ -2459,12 +2854,12 @@ private class ConfigCanvas extends Canvas {
         } else if (focusIndex == 9) {
             midlet.switchToThemes();
         } else if (focusIndex == 10) {
-            Form aboutForm = new Form("Omega v1.08");
+            Form aboutForm = new Form("Omega v1.09");
             aboutForm.append(new StringItem("", "Universal J2ME AI Client.\n"));
             
             aboutForm.append(new StringItem("Shortcuts:", "- D-Pad Up / Down: Scroll\n- Fire: Full text input\n- Left Softkey: Chat / Select\n- Right Softkey: Exit / Back\n- Key '0': Delete chat\n"));
 
-            aboutForm.append(new StringItem("\nChangelog:", "- Added check for chat deletion on proxy server (if used).\n"));
+            aboutForm.append(new StringItem("\nChangelog:", "- Added Over-The-Air update from GitHub repo.\n"));
 
             aboutForm.append(new StringItem("", "\nwith love by bebrauwu <3"));
             Command backCmd = new Command("Back", Command.BACK, 1);
@@ -3127,8 +3522,18 @@ private class TerminalCanvas extends Canvas {
     private Image checkerTile = null;
     private boolean checkerFailed = false;
     private final int CHECK_CELL = 2;                       // размер клетки узора, пиксели
-    private final int A_SEND = 1, A_ADD = 2, A_FULL = 3, A_REGEN = 4, A_NEXT = 5, A_PREV = 6, A_EDIT = 7, A_SEARCH = 8;
-
+    private final int A_SEND = 1, A_ADD = 2, A_FULL = 3, A_REGEN = 4, A_NEXT = 5, A_PREV = 6, A_EDIT = 7, A_SEARCH = 8, A_FAST = 9;
+    // Полоса прокрутки справа и режим быстрой прокрутки
+    private int sbW = 2;                                    // текущая ширина полосы (плавно меняется от 2 до SB_WIDE)
+    private boolean sbWant = false;                         // нужна широкая полоса (после касания в её области)
+    private boolean sbDrag = false;                         // палец ведёт ползунок
+    
+    private long sbHold = 0;                                // до какого момента держать широкую полосу после касания
+    private int sbMax = 0;                                  // на сколько пикселей можно прокрутить чат
+    private boolean fastMode = false;                       // режим быстрой прокрутки: вверх/вниз прыгают по сообщениям
+    private final int SB_WIDE = 16;
+    private final int SB_HIT = 24;                          // ширина зоны касания у правого края
+ 
     private int scrollOffset = 0;
     private StringBuffer currentInput = new StringBuffer();
     private int cursorPos = 0;                       // положение курсора в строке ввода
@@ -3200,6 +3605,7 @@ private class TerminalCanvas extends Canvas {
                 while (running) {
                     try { Thread.sleep(50); } catch (Exception e) {}
                     if (!isShown()) continue;
+                    boolean sbAnim = sbStep();                       // плавная смена ширины полосы прокрутки
                     if (isLoading) {
                         // Ожидание: вращаем индикатор и считаем секунды
                         if (loadStart == 0) loadStart = System.currentTimeMillis();
@@ -3211,6 +3617,7 @@ private class TerminalCanvas extends Canvas {
                         boolean redraw = false;
                         blinkTick++;
                         if (blinkTick >= 10) { blinkTick = 0; cursorOn = !cursorOn; redraw = true; }   // курсор мигает раз в 0,5 с
+                        if (sbAnim) redraw = true;
                         if (hintAlpha() > 0) { hintWasShown = true; redraw = true; }
                         else if (hintWasShown) { hintWasShown = false; redraw = true; }                  // последний кадр: подсказка исчезла
                         if (redraw) repaint();
@@ -4267,6 +4674,8 @@ private class TerminalCanvas extends Canvas {
  
         // Текст чата рисуется со смещением в пикселях и обрезается по своей области
         scroller.setMax(wrappedLines.size() * fh - viewH);
+        sbMax = wrappedLines.size() * fh - viewH;
+        if (sbMax < 0) sbMax = 0;
         int pos = scroller.getPos();
         g.setClip(0, chatTop, w, viewH);
         int cMain = midlet.colorMain;
@@ -4304,6 +4713,7 @@ private class TerminalCanvas extends Canvas {
  
         int ha = hintAlpha();
         if (ha > 0) drawHint(g, font, w, chatTop, viewH, ha);
+        drawScrollbar(g, w, chatTop, viewH);
         g.setClip(0, 0, w, h);
  
         inputTop = h - bottomBarHeight - inputAreaHeight - 2;
@@ -4347,7 +4757,7 @@ private class TerminalCanvas extends Canvas {
         g.setColor(midlet.colorMain);
         g.drawLine(0, h - bottomBarHeight, w, h - bottomBarHeight);
  
-        String leftBtnStr = "[FUNC.]";
+        String leftBtnStr = fastMode ? "[EXIT FAST]" : "[MENU]";
         g.drawString(leftBtnStr, 10, h - 26, Graphics.TOP | Graphics.LEFT);
  
         String rightBtnStr = "[CONFIG]";
@@ -4598,6 +5008,9 @@ private class TerminalCanvas extends Canvas {
     private void handleKey(int keyCode, boolean repeat) {
         int ga = 0;
         try { ga = getGameAction(keyCode); } catch (Exception e) {}
+ 
+        // Режим быстрой прокрутки: курсор и ввод заморожены
+        if (fastMode) { fastKey(keyCode, ga, repeat); return; }
  
         // Открыто меню: все клавиши идут в него
         if (menuOpen) { menuKey(keyCode, ga, repeat); return; }
@@ -5068,6 +5481,111 @@ private class TerminalCanvas extends Canvas {
         });
         display.setCurrent(tb);
     }
+
+        // ----- Полоса прокрутки и быстрая прокрутка -----
+    // Плавно меняет ширину полосы: широкая во время касания, в режиме быстрой прокрутки и ещё пару секунд после,
+    // потом сворачивается до двух пикселей. Возвращает true, пока идёт анимация (нужна перерисовка)
+    private boolean sbStep() {
+        boolean want = sbWant || sbDrag || fastMode || System.currentTimeMillis() < sbHold;
+        int target = want ? SB_WIDE : 2;
+        if (sbW == target) return false;
+        if (sbW < target) { sbW += 3; if (sbW > target) sbW = target; }
+        else { sbW -= 2; if (sbW < target) sbW = target; }
+        return true;
+    }
+ 
+    private int sbThumbH(int viewH) {
+        int th = (viewH * viewH) / (sbMax + viewH);
+        if (th < 14) th = 14;
+        if (th > viewH) th = viewH;
+        return th;
+    }
+ 
+    private void drawScrollbar(Graphics g, int w, int top, int viewH) {
+        if (sbMax <= 0 || viewH < 24) return;
+        int th = sbThumbH(viewH);
+        int ty = top + (int) (((long) (viewH - th) * scroller.getPos()) / sbMax);
+        int bw = sbW;
+        int x = w - bw;
+        if (bw > 4) {
+            // Широкая полоса: дорожка с рамкой и ползунок
+            g.setColor(midlet.colorSoftbarBg);
+            g.fillRect(x, top, bw, viewH);
+            g.setColor(Omega.mixColor(midlet.colorMain, midlet.colorBg, 62));
+            g.drawLine(x, top, x, top + viewH - 1);
+            g.setColor(midlet.colorMain);
+            g.fillRect(x + 3, ty + 1, bw - 5, th - 2);
+        } else {
+            // Свёрнутая: два пикселя, только ползунок
+            int c = Omega.mixColor(midlet.colorMain, midlet.colorBg, 62);
+            if (Omega.colorDistance(c, midlet.colorBg) < 110) c = midlet.colorMain;
+            g.setColor(c);
+            g.fillRect(x, ty, bw, th);
+        }
+    }
+ 
+    // Ставит позицию чата по положению пальца на полосе
+    private void sbSetFromY(int y) {
+        int viewH = chatBotY - chatTopY;
+        if (sbMax <= 0 || viewH < 24) return;
+        int th = sbThumbH(viewH);
+        int range = viewH - th;
+        if (range <= 0) return;
+        int rel = y - chatTopY - th / 2;
+        if (rel < 0) rel = 0;
+        if (rel > range) rel = range;
+        followStream = false;
+        scroller.jump((int) (((long) rel * sbMax) / range));
+        repaint();
+    }
+ 
+    private void enterFast() {
+        fastMode = true;
+        sbWant = true;
+        repaint();
+    }
+ 
+    private void exitFast() {
+        fastMode = false;
+        sbWant = false;
+        sbHold = System.currentTimeMillis() + 1500;
+        wake();
+    }
+ 
+    // В режиме быстрой прокрутки: вверх и вниз прыгают к началу предыдущего и следующего сообщения,
+    // джойстик влево, обе софт-клавиши выходят. Курсор и ввод заморожены
+    private void fastKey(int keyCode, int ga, boolean repeat) {
+        boolean nav = keyCode < 0;
+        if (keyCode == -6 || keyCode == -7 || (nav && ga == LEFT)) {
+            if (!repeat) exitFast();
+            return;
+        }
+        if (nav && ga == UP) fastJump(-1);
+        else if (nav && ga == DOWN) fastJump(1);
+    }
+ 
+    private void fastJump(int dir) {
+        int fh = Omega.uiFont().getHeight();
+        int pos = scroller.getPos();
+        followStream = false;
+        if (dir > 0) {
+            for (int k = 0; k < msgLineStart.size(); k++) {
+                int s = ((Integer) msgLineStart.elementAt(k)).intValue() * fh;
+                if (s > pos) { scroller.jump(s); repaint(); return; }
+            }
+            if (backLine >= 0) { backToLatest(); return; }
+            scroller.jumpToEnd();
+            repaint();
+        } else {
+            for (int k = msgLineStart.size() - 1; k >= 0; k--) {
+                int s = ((Integer) msgLineStart.elementAt(k)).intValue() * fh;
+                if (s < pos) { scroller.jump(s); repaint(); return; }
+            }
+            if (loadMoreLine >= 0) { loadMoreMessages(); return; }
+            scroller.jump(0);
+            repaint();
+        }
+    }
  
     // ----- Меню чата на левой софт-клавише -----
     private void addMenuItem(String label, int act) {
@@ -5095,6 +5613,7 @@ private class TerminalCanvas extends Canvas {
         }
         if (st.size() > 0) addMenuItem("Edit last message", A_EDIT);
         if (st.size() > 0) addMenuItem("Search messages", A_SEARCH);
+        addMenuItem("Fast scroll", A_FAST);
         menuSel = 0;
         menuScroll = 0;
         menuOpen = true;
@@ -5118,6 +5637,7 @@ private class TerminalCanvas extends Canvas {
         else if (act == A_PREV) switchVariant(-1);
         else if (act == A_EDIT) editLast();
         else if (act == A_SEARCH) openSearchBox();
+        else if (act == A_FAST) enterFast();
     }
  
     private void menuKey(int keyCode, int ga, boolean repeat) {
@@ -5256,6 +5776,14 @@ private class TerminalCanvas extends Canvas {
         // Касание, начавшееся на софтбаре, скроллом не считается
         if (y > getHeight() - 35) { pressInBar = true; return; }
         pressInBar = false;
+        // Касание у правого края открывает полосу прокрутки и ведёт ползунок
+        if (x >= getWidth() - SB_HIT && y >= chatTopY && y < chatBotY && sbMax > 0) {
+            sbDrag = true;
+            sbSetFromY(y);
+            return;
+        }
+        sbWant = false;
+        sbHold = 0;
         // Зона листания ввода шире самого поля: на строку вверх и немного вниз
         int fhp = Omega.uiFont().getHeight();
         if (!isLoading && y >= inputTop - fhp && y < inputBottom + 6 && inLineStarts.size() > 3) {
@@ -5272,6 +5800,7 @@ private class TerminalCanvas extends Canvas {
  
     protected void pointerDragged(int x, int y) {
         if (menuOpen) return;
+        if (sbDrag) { sbSetFromY(y); return; }
         if (pressInBar) return;
         if (inDrag) {
             int sh = Omega.uiFont().getHeight() * 2 / 3;      // порог 2/3 строки: отзывчивее
@@ -5298,12 +5827,19 @@ private class TerminalCanvas extends Canvas {
         int h = getHeight();
         boolean inBar = y > h - 35;
         if (menuOpen) { menuPointer(x, y); return; }
+        if (sbDrag) {
+            sbDrag = false;
+            sbHold = System.currentTimeMillis() + 2000;     // широкая полоса остаётся ещё пару секунд
+            repaint();
+            return;
+        }
  
         // Кнопки софтбара срабатывают, только если касание и началось, и закончилось на нём
         if (pressInBar) {
             pressInBar = false;
             if (inBar) {
-                if (x < w / 2) { // Left: меню чата
+                if (fastMode) { exitFast(); }                 // в режиме быстрой прокрутки обе кнопки выходят из него
+                else if (x < w / 2) { // Left: меню чата
                     if (!isLoading) openMenu();
                 } else { // Right: CONFIG
                     if (isLoading) { stopLoading(); }
