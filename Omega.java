@@ -1016,6 +1016,30 @@ public static int emphColor(int main, int bg) {
     return mixColor(main, lum < 128 ? 0xFFFFFF : 0x000000, 45);
 }
 
+// Подпись в полосе шириной maxW. Если не влезает: у выбранной строки (scroll=true) она бежит по кругу,
+// у остальных обрезается с многоточием. Возвращает true, если строка бежит (канвасу нужно перерисовываться по таймеру)
+public static boolean drawFit(Graphics g, Font f, String text, int x, int y, int maxW, int tick, boolean scroll) {
+    if (maxW < 8) return false;
+    if (f.stringWidth(text) <= maxW) {
+        g.drawString(text, x, y, Graphics.TOP | Graphics.LEFT);
+        return false;
+    }
+    if (!scroll) {
+        String r = text;
+        while (r.length() > 1 && f.stringWidth(r + "...") > maxW) r = r.substring(0, r.length() - 1);
+        g.drawString(r + "...", x, y, Graphics.TOP | Graphics.LEFT);
+        return false;
+    }
+    int cx = g.getClipX(), cy = g.getClipY(), cw = g.getClipWidth(), ch = g.getClipHeight();
+    g.clipRect(x, y, maxW, f.getHeight());
+    int period = text.length() + 5;
+    int s = (tick / 4) % (period + 12);            // 12 шагов паузы в начале, потом бег
+    int shift = (s < 12) ? 0 : s - 12;
+    g.drawString((text + "     " + text).substring(shift), x, y, Graphics.TOP | Graphics.LEFT);
+    g.setClip(cx, cy, cw, ch);
+    return true;
+}
+
 public static Font uiFont() {
     return Font.getFont(Font.FACE_MONOSPACE, Font.STYLE_BOLD, Font.SIZE_MEDIUM);
 }
@@ -2029,9 +2053,25 @@ private class CustomSelectCanvas extends Canvas {
         "is no more. rust in peace.", "sent to the digital shadow realm."
     };
 
+    private int tick = 0;                      // счётчик для бегущих строк
+    private boolean marqueeOn = false;            // на экране сейчас есть бегущая строка
+
+    // Таймер бегущих строк: перерисовывает экран только пока есть что двигать
+    private void startMarquee() {
+        new Thread(new Runnable() {
+            public void run() {
+                while (true) {
+                    try { Thread.sleep(50); } catch (Exception e) {}
+                    if (marqueeOn && isShown()) { tick++; repaint(); }
+                }
+            }
+        }).start();
+    }
+
     public CustomSelectCanvas(Omega m) {
         midlet = m;
         setFullScreenMode(true);
+        startMarquee();
     }
 
     public void open(String title, Vector items, int initialSel, SelectCallback callback, Runnable cancelCallback) {
@@ -2121,23 +2161,41 @@ private class CustomSelectCanvas extends Canvas {
         // Удаление чата на сервере. Сначала обычный запрос, потом проверка по списку чатов: если чат всё ещё
     // на сервере (так бывает на телефонах с патчем виртуальной машины), пробуем другие способы по очереди
     private void deleteChatOnServer(String cName) {
-        if (midlet.proxyUrl == null || midlet.proxyUrl.trim().length() == 0) return;
+        if (midlet.proxyUrl == null || midlet.proxyUrl.trim().length() == 0) { showDelInfo(cName, "server: no proxy URL"); return; }
         String base = midlet.proxyUrl.trim();
         if (base.endsWith("/")) base = base.substring(0, base.length() - 1);
+        String[] names = { "GET", "GET-R", "POST", "DELETE" };
+        StringBuffer trace = new StringBuffer();
         for (int mode = 0; mode < 4; mode++) {
-            sendDeleteRequest(base, cName, mode);
+            String err = sendDeleteRequest(base, cName, mode);
             int st = chatOnServer(base, cName);
-            if (st != 1) return;               // удалён, или проверить не удалось: дальше не настаиваем
+            if (st == 0) { showDelInfo(cName, "server: ok (" + names[mode] + ")"); return; }
+            if (st == -1) { showDelInfo(cName, "server: check failed (" + names[mode] + (err.length() > 0 ? " " + err : "") + ")"); return; }
+            trace.append(names[mode]).append(err.length() > 0 ? ":" + err : ":sent").append(' ');
         }
+        showDelInfo(cName, "server: NOT deleted [" + trace.toString().trim() + "]");
+    }
+
+    private void showDelInfo(final String cName, final String info) {
+        midlet.display.callSerially(new Runnable() {
+            public void run() {
+                // Только если уведомление об этом чате ещё на экране
+                if (currentDeletedNotice.length() > 0 && currentDeletedNotice.indexOf(cName) >= 0) {
+                    currentDeletedNotice = currentDeletedNotice + " " + info;
+                    repaint();
+                }
+            }
+        });
     }
  
     // Один запрос на удаление. mode 0: GET как раньше; 1: GET только на чтение; 2: POST; 3: метод DELETE
-    private void sendDeleteRequest(String base, String cName, int mode) {
+    private String sendDeleteRequest(String base, String cName, int mode) {
         HttpConnection c = null;
         OutputStream os = null;
         InputStream is = null;
+        String err = "";
         try {
-            String url = base + "/?type=delete&chat=" + midlet.escapeUrl(cName) + "&key=" + midlet.escapeUrl(midlet.apiKey);
+            String url = base + "/?type=delete&chat=" + midlet.escapeUrl(cName);
             if (mode == 0) {
                 c = (HttpConnection) Connector.open(url);
                 c.setRequestMethod(HttpConnection.GET);
@@ -2162,16 +2220,20 @@ private class CustomSelectCanvas extends Canvas {
                 c.setRequestMethod("DELETE");
                 c.setRequestProperty("Connection", "close");
             }
-            c.getResponseCode();
+            int rc = c.getResponseCode();
+            if (rc != 200) err = "HTTP" + rc;
             is = c.openInputStream();
             while (is.read() != -1) { }        // дочитываем ответ до конца, чтобы запрос точно завершился
-        } catch (Exception e) {
-            // Не получилось этим способом: проверка ниже покажет, остался ли чат на сервере
+        } catch (Throwable e) {
+            // Не получилось этим способом: проверка по списку покажет, остался ли чат на сервере
+            String m = String.valueOf(e);
+            err = m.length() > 30 ? m.substring(0, 30) : m;
         } finally {
             try { if (is != null) is.close(); } catch (Exception e) {}
             try { if (os != null) os.close(); } catch (Exception e) {}
             try { if (c != null) c.close(); } catch (Exception e) {}
         }
+        return err;
     }
  
     // Есть ли чат в списке на сервере: 1 да, 0 нет, -1 проверить не удалось
@@ -2271,6 +2333,7 @@ private class CustomSelectCanvas extends Canvas {
     }
  
     protected void paint(Graphics g) {
+        marqueeOn = false;
         int w = getWidth();
         int h = getHeight();
  
@@ -2333,53 +2396,38 @@ private class CustomSelectCanvas extends Canvas {
                     if (deleteState == 1 && deletingIndex == i) {
                         String quoteStr = "[" + currentConfirmQuote + "]";
                         int quoteW = font.stringWidth(quoteStr);
-                        int maxItemW = w - quoteW - 14;
- 
-                        String renderItemText = itemText;
-                        while (renderItemText.length() > 1 && font.stringWidth(renderItemText) > maxItemW) {
-                            renderItemText = renderItemText.substring(0, renderItemText.length() - 1);
-                        }
-                        if (!renderItemText.equals(itemText)) renderItemText += "...";
- 
-                        g.drawString(renderItemText, 6, y, Graphics.TOP | Graphics.LEFT);
-                        // Цвет подтверждения подбирается так, чтобы он читался на фоне строки
                         int rowBg = isSel ? midlet.colorFocusBg : midlet.colorBg;
-                        g.setColor(midlet.visibleColor(midlet.colorWarn, rowBg));
-                        g.drawString(quoteStr, w - quoteW - 6, y, Graphics.TOP | Graphics.LEFT);
+                        int nameW = font.stringWidth(itemText);
+                        if (nameW + quoteW + 20 <= w) {
+                            // Всё влезает: имя слева, реплика справа
+                            g.drawString(itemText, 6, y, Graphics.TOP | Graphics.LEFT);
+                            g.setColor(midlet.visibleColor(midlet.colorWarn, rowBg));
+                            g.drawString(quoteStr, w - quoteW - 6, y, Graphics.TOP | Graphics.LEFT);
+                        } else {
+                            // Не влезает: имя и реплика бегут одной строкой, обрезать реплику нельзя
+                            g.setColor(midlet.visibleColor(midlet.colorWarn, rowBg));
+                            if (Omega.drawFit(g, font, itemText + " " + quoteStr, 6, y, w - 12, tick, true)) marqueeOn = true;
+                        }
                     } else {
                         String btnStr = "[DEL]";
                         int btnW = font.stringWidth(btnStr) + 8;
                         int maxItemW = w - btnW - 14;
  
-                        String renderItemText = itemText;
-                        while (renderItemText.length() > 1 && font.stringWidth(renderItemText) > maxItemW) {
-                            renderItemText = renderItemText.substring(0, renderItemText.length() - 1);
-                        }
-                        if (!renderItemText.equals(itemText)) renderItemText += "...";
- 
-                        g.drawString(renderItemText, 6, y, Graphics.TOP | Graphics.LEFT);
+                        if (Omega.drawFit(g, font, itemText, 6, y, maxItemW, tick, isSel)) marqueeOn = true;
                         g.setColor(isSel ? 0xFFFFFF : midlet.colorMain);
                         g.drawString(btnStr, w - btnW + 4, y, Graphics.TOP | Graphics.LEFT);
                     }
                 } else {
-                    g.drawString(itemText, 6, y, Graphics.TOP | Graphics.LEFT);
+                    if (Omega.drawFit(g, font, itemText, 6, y, w - 12, tick, isSel)) marqueeOn = true;
                 }
             }
             g.setClip(0, 0, w, h);
         }
  
         if (currentDeletedNotice.length() > 0) {
-            String notice = currentDeletedNotice;
-            int maxNoticeW = w - 12;
-            while (notice.length() > 4 && font.stringWidth(notice) > maxNoticeW) {
-                notice = notice.substring(0, notice.length() - 1);
-            }
-            if (!notice.equals(currentDeletedNotice)) {
-                notice = notice.substring(0, notice.length() - 3) + "...";
-            }
             g.setColor(midlet.visibleColor(midlet.colorError, midlet.colorBg));
-            // Привязка к нижнему краю над софтбаром: не зависит от высоты шрифта
-            g.drawString(notice, 6, h - bottomBarHeight - 4, Graphics.BOTTOM | Graphics.LEFT);
+            // Над софтбаром; длинная реплика бежит по строке, а не обрезается
+            if (Omega.drawFit(g, font, currentDeletedNotice, 6, h - bottomBarHeight - 4 - font.getHeight(), w - 12, tick, true)) marqueeOn = true;
         }
  
         // SOFTBAR (Left: SELECT, Right: BACK - FIXED per user instructions)
@@ -2854,7 +2902,7 @@ private class ConfigCanvas extends Canvas {
         } else if (focusIndex == 9) {
             midlet.switchToThemes();
         } else if (focusIndex == 10) {
-            Form aboutForm = new Form("Omega v1.09");
+            Form aboutForm = new Form("Omega v1.0.10");
             aboutForm.append(new StringItem("", "Universal J2ME AI Client.\n"));
             
             aboutForm.append(new StringItem("Shortcuts:", "- D-Pad Up / Down: Scroll\n- Fire: Full text input\n- Left Softkey: Chat / Select\n- Right Softkey: Exit / Back\n- Key '0': Delete chat\n"));
@@ -2983,17 +3031,35 @@ private class ThemeCanvas extends Canvas {
     private int touchLastY = 0;
     private boolean isDragging = false;
 
-    private final String[] COLOR_SLOT_NAMES = {"[BG COLOR]", "[MAIN COLOR]", "[WARNING COLOR]", "[ERROR COLOR]"};
+        // Слоты темы: 0 фон, 1 основной, 2 шапка, 3 выделение строки, 4 нижняя панель, 5 предупреждение, 6 ошибка
+    private final String[] COLOR_SLOT_NAMES = {"[BG COLOR]", "[MAIN COLOR]", "[HEADER BG]", "[FOCUS BG]", "[SOFTBAR BG]", "[WARNING COLOR]", "[ERROR COLOR]"};
+    private final int NSLOT = 7;
     private final String[] CONFIRM_QUOTES = {"sure?"};
     private final String[] DELETED_QUOTES = {"was deleted.", "was destroyed.", "was obliterated."};
 
     private final Scroller scroller = new Scroller(this);
     private boolean pressInBar = false;
 
+    private int tick = 0;                      // счётчик для бегущих строк
+    private boolean marqueeOn = false;            // на экране сейчас есть бегущая строка
+
+    // Таймер бегущих строк: перерисовывает экран только пока есть что двигать
+    private void startMarquee() {
+        new Thread(new Runnable() {
+            public void run() {
+                while (true) {
+                    try { Thread.sleep(50); } catch (Exception e) {}
+                    if (marqueeOn && isShown()) { tick++; repaint(); }
+                }
+            }
+        }).start();
+    }
+
     public ThemeCanvas(Omega m) {
         midlet = m;
         setFullScreenMode(true);
         refreshThemeList();
+        startMarquee();
     }
 
     private void refreshThemeList() {
@@ -3042,6 +3108,7 @@ private class ThemeCanvas extends Canvas {
     }
  
     protected void paint(Graphics g) {
+        marqueeOn = false;
         int w = getWidth();
         int h = getHeight();
         int bottomBarHeight = 35;
@@ -3069,7 +3136,8 @@ private class ThemeCanvas extends Canvas {
         } else {
             g.drawString("== OMEGA // THEMES ==", 4, 2, Graphics.TOP | Graphics.LEFT);
             int startY = fh + 8;
-            int[] currentColors = {midlet.colorBg, midlet.colorMain, midlet.colorWarn, midlet.colorError};
+            int[] currentColors = {midlet.colorBg, midlet.colorMain, midlet.colorHeaderBg, midlet.colorFocusBg, midlet.colorSoftbarBg, midlet.colorWarn, midlet.colorError};
+            wheelImg = null;                                // круг больше не нужен: память освобождается
  
             // Список рисуется со смещением в пикселях и обрезается по области между шапкой и софтбаром
             updateScrollBounds();
@@ -3098,49 +3166,37 @@ private class ThemeCanvas extends Canvas {
                     boolean confirming = (deleteState == 1 && deletingIndex == i);
                     String rightStr = confirming ? "[" + currentConfirmQuote + "]" : "[DEL]";
                     int rightW = font.stringWidth(rightStr) + (confirming ? 12 : 8);
-                    int maxItemW = w - rightW - 8;
- 
-                    String renderItemText = itemText;
-                    while (renderItemText.length() > 1 && font.stringWidth(renderItemText) > maxItemW) {
-                        renderItemText = renderItemText.substring(0, renderItemText.length() - 1);
-                    }
-                    if (!renderItemText.equals(itemText)) renderItemText += "...";
- 
-                    g.drawString(renderItemText, 6, y, Graphics.TOP | Graphics.LEFT);
-                    if (confirming) {
-                        // Цвет подтверждения подбирается так, чтобы он читался на фоне строки
-                        int rowBg = isSel ? midlet.colorFocusBg : midlet.colorBg;
+                    int rowBg = isSel ? midlet.colorFocusBg : midlet.colorBg;
+                    if (confirming && font.stringWidth(itemText) + rightW + 8 > w) {
+                        // Не влезает: имя и реплика бегут одной строкой
                         g.setColor(midlet.visibleColor(midlet.colorWarn, rowBg));
-                        g.drawString(rightStr, w - font.stringWidth(rightStr) - 6, y, Graphics.TOP | Graphics.LEFT);
+                        if (Omega.drawFit(g, font, itemText + " " + rightStr, 6, y, w - 12, tick, true)) marqueeOn = true;
                     } else {
-                        g.setColor(isSel ? 0xFFFFFF : midlet.colorMain);
-                        g.drawString(rightStr, w - rightW, y, Graphics.TOP | Graphics.LEFT);
+                        if (Omega.drawFit(g, font, itemText, 6, y, w - rightW - 8, tick, isSel)) marqueeOn = true;
+                        if (confirming) {
+                            g.setColor(midlet.visibleColor(midlet.colorWarn, rowBg));
+                            g.drawString(rightStr, w - font.stringWidth(rightStr) - 6, y, Graphics.TOP | Graphics.LEFT);
+                        } else {
+                            g.setColor(isSel ? 0xFFFFFF : midlet.colorMain);
+                            g.drawString(rightStr, w - rightW, y, Graphics.TOP | Graphics.LEFT);
+                        }
                     }
-                } else if (showPaletteMenu && i > items.size() - 5) {
-                    int slotIdx = i - (items.size() - 4);
-                    g.drawString(itemText, 6, y, Graphics.TOP | Graphics.LEFT);
+                } else if (showPaletteMenu && i > items.size() - (NSLOT + 1)) {
+                    int slotIdx = i - (items.size() - NSLOT);
+                    if (Omega.drawFit(g, font, itemText, 6, y, w - 56, tick, isSel)) marqueeOn = true;
                     g.setColor(currentColors[slotIdx]);
                     g.fillRect(w - 44, y, 32, fh - 4);
                     g.setColor(midlet.colorMain);
                     g.drawRect(w - 44, y, 32, fh - 4);
                 } else {
-                    g.drawString(itemText, 6, y, Graphics.TOP | Graphics.LEFT);
+                    if (Omega.drawFit(g, font, itemText, 6, y, w - 12, tick, isSel)) marqueeOn = true;
                 }
             }
             g.setClip(0, 0, w, h);
  
             if (currentDeletedNotice.length() > 0) {
-                String notice = currentDeletedNotice;
-                int maxNoticeW = w - 12;
-                while (notice.length() > 4 && font.stringWidth(notice) > maxNoticeW) {
-                    notice = notice.substring(0, notice.length() - 1);
-                }
-                if (!notice.equals(currentDeletedNotice)) {
-                    notice = notice.substring(0, notice.length() - 3) + "...";
-                }
                 g.setColor(midlet.visibleColor(midlet.colorError, midlet.colorBg));
-                // Привязка к нижнему краю над софтбаром: не зависит от высоты шрифта
-                g.drawString(notice, 6, h - bottomBarHeight - 4, Graphics.BOTTOM | Graphics.LEFT);
+                if (Omega.drawFit(g, font, currentDeletedNotice, 6, h - bottomBarHeight - 4 - font.getHeight(), w - 12, tick, true)) marqueeOn = true;
             }
         }
  
@@ -3157,53 +3213,146 @@ private class ThemeCanvas extends Canvas {
         g.drawString(rightBtn, w - font.stringWidth(rightBtn) - 10, h - 26, Graphics.TOP | Graphics.LEFT);
     }
 
-    private void drawColorWheel(Graphics g, int w, int h) {
-        int cx = w / 2;
-        int cy = h / 2 - 20;
-        int radius = Math.min(w, h) / 3 - 5;
-        if (radius < 10) radius = 40;
+        // ----- Цветовой круг: оттенок по углу, насыщенность по расстоянию от центра -----
+    private Image wheelImg = null;                          // готовая картинка круга (создаётся при открытии, освобождается при выходе)
+    private int wheelD = 0;                                 // диаметр картинки
+    private int wcx = 0, wcy = 0, wR = 0;                   // центр и радиус круга на экране
 
-        for (int i = 0; i < 24; i++) {
-            int angle = i * 15;
-            g.setColor(hsvToRgb(angle, sat, val));
-            int x1 = cx + (getCos(angle) * (radius - 12)) / 1000;
-            int y1 = cy + (getSin(angle) * (radius - 12)) / 1000;
-            int x2 = cx + (getCos(angle) * radius) / 1000;
-            int y2 = cy + (getSin(angle) * radius) / 1000;
-            g.drawLine(x1, y1, x2, y2);
+    // Угол точки (dx, dy) относительно центра в градусах 0..359, считается по часовой стрелке от направления вправо.
+    // В CLDC нет atan, поэтому приближение: ошибка меньше четверти градуса
+    private int angleOf(int dx, int dy) {
+        if (dx == 0 && dy == 0) return 0;
+        int ax = dx < 0 ? -dx : dx;
+        int ay = dy < 0 ? -dy : dy;
+        float t = (ax >= ay) ? (float) ay / (float) ax : (float) ax / (float) ay;
+        float a = 45f * t + 15.64f * t * (1f - t);
+        if (ax < ay) a = 90f - a;
+        if (dx >= 0 && dy < 0) a = 360f - a;
+        else if (dx < 0 && dy >= 0) a = 180f - a;
+        else if (dx < 0 && dy < 0) a = 180f + a;
+        int r = (int) (a + 0.5f);
+        return r % 360;
+    }
+
+    private int hsvInt(int h, int s, int v) {
+        h = ((h % 360) + 360) % 360;
+        int i = h / 60;
+        int f = ((h % 60) * 255) / 60;
+        int p = (v * (255 - s)) / 255;
+        int q = (v * (255 - (s * f) / 255)) / 255;
+        int t = (v * (255 - (s * (255 - f)) / 255)) / 255;
+        int r, g, b;
+        switch (i) {
+            case 0: r = v; g = t; b = p; break;
+            case 1: r = q; g = v; b = p; break;
+            case 2: r = p; g = v; b = t; break;
+            case 3: r = p; g = q; b = v; break;
+            case 4: r = t; g = p; b = v; break;
+            default: r = v; g = p; b = q; break;
         }
+        return (r << 16) | (g << 8) | b;
+    }
 
-        int nearestAngle = ((hue + 7) / 15) * 15;
-        if (nearestAngle >= 360) nearestAngle = 0;
-        int kx = cx + (getCos(nearestAngle) * (radius - 6)) / 1000;
-        int ky = cy + (getSin(nearestAngle) * (radius - 6)) / 1000;
-        g.setColor(0xFFFFFF);
-        g.fillRect(kx - 3, ky - 3, 7, 7);
+    // Рисует круг в картинку (яркость на круг не влияет, её задаёт ползунок Val). Вне круга пиксели прозрачные
+    private Image buildWheel(int d) {
+        try {
+            int r = d / 2;
+            int r2 = r * r;
+            int[] px = new int[d * d];
+            for (int y = 0; y < d; y++) {
+                int dy = y - r;
+                for (int x = 0; x < d; x++) {
+                    int dx = x - r;
+                    int dd = dx * dx + dy * dy;
+                    if (dd > r2) continue;
+                    int s = (int) (Math.sqrt((double) dd) * 255.0 / (double) r);
+                    if (s > 255) s = 255;
+                    px[y * d + x] = 0xFF000000 | hsvInt(angleOf(dx, dy), s, 255);
+                }
+            }
+            Image im = Image.createRGBImage(px, d, d, true);
+            px = null;
+            return im;
+        } catch (Throwable e) {
+            return null;                                    // не хватило памяти: останутся ползунки
+        }
+    }
 
-        g.setColor(hsvToRgb(hue, sat, val));
-        g.fillArc(cx - 14, cy - 14, 28, 28, 0, 360);
-        g.setColor(0xFFFFFF);
-        g.drawArc(cx - 14, cy - 14, 28, 28, 0, 360);
 
+    private void drawColorWheel(Graphics g, int w, int h) {
+        Font font = Omega.uiFont();
         int satY = h - 95;
-        g.setColor(0x555555);
-        g.fillRect(20, satY, w - 40, 8);
+        int valY = h - 55;
+        int top = font.getHeight() + 16;
+        int bottom = satY - 24;
+        int d = bottom - top;
+        if (d > w - 16) d = w - 16;
+        if (d > 128) d = 128;                               // крупнее не нужно, а память на S40 небольшая
+        if (d < 24) d = 24;
+        d = d - (d % 2);
+        wR = d / 2;
+        wcx = w / 2;
+        wcy = top + (bottom - top) / 2;
+
+        if (wheelImg == null || wheelD != d) {
+            wheelImg = buildWheel(d);
+            wheelD = d;
+        }
+        if (wheelImg != null) {
+            g.drawImage(wheelImg, wcx - wR, wcy - wR, Graphics.TOP | Graphics.LEFT);
+        }
+        g.setColor(midlet.colorMain);
+        g.drawArc(wcx - wR, wcy - wR, d, d, 0, 360);
+
+        // Маркер выбранной точки
+        double rad = hue * Math.PI / 180.0;
+        int mr = (sat * wR) / 255;
+        int kx = wcx + (int) (Math.cos(rad) * mr);
+        int ky = wcy + (int) (Math.sin(rad) * mr);
+        g.setColor(0x000000);
+        g.drawArc(kx - 5, ky - 5, 10, 10, 0, 360);
+        g.setColor(0xFFFFFF);
+        g.drawArc(kx - 4, ky - 4, 8, 8, 0, 360);
+
+        int cur = hsvInt(hue, sat, val);
+
+        // Sat: градиент от серого до чистого цвета
+        g.setColor(0xFFFFFF);
+        g.drawString("Sat: " + sat, 20, satY - 18, Graphics.TOP | Graphics.LEFT);
+        for (int x = 20; x < w - 20; x += 2) {
+            g.setColor(hsvInt(hue, ((x - 20) * 255) / (w - 40), val));
+            g.fillRect(x, satY, 2, 8);
+        }
         g.setColor(activeHsvControl == 1 ? midlet.colorWarn : midlet.colorMain);
         g.drawRect(20, satY, w - 40, 8);
         int satX = 20 + ((w - 40) * sat) / 255;
         g.setColor(0xFFFFFF);
-        g.fillRect(satX - 5, satY - 4, 10, 16);
-        g.drawString("Sat: " + sat, 20, satY - 18, Graphics.TOP | Graphics.LEFT);
+        g.fillRect(satX - 3, satY - 4, 6, 16);
 
-        int valY = h - 55;
-        g.setColor(0x555555);
-        g.fillRect(20, valY, w - 40, 8);
+        // Val: градиент от чёрного до яркого
+        g.setColor(0xFFFFFF);
+        g.drawString("Val: " + val, 20, valY - 18, Graphics.TOP | Graphics.LEFT);
+        for (int x = 20; x < w - 20; x += 2) {
+            g.setColor(hsvInt(hue, sat, ((x - 20) * 255) / (w - 40)));
+            g.fillRect(x, valY, 2, 8);
+        }
         g.setColor(activeHsvControl == 2 ? midlet.colorWarn : midlet.colorMain);
         g.drawRect(20, valY, w - 40, 8);
         int valX = 20 + ((w - 40) * val) / 255;
         g.setColor(0xFFFFFF);
-        g.fillRect(valX - 5, valY - 4, 10, 16);
-        g.drawString("Val: " + val, 20, valY - 18, Graphics.TOP | Graphics.LEFT);
+        g.fillRect(valX - 3, valY - 4, 6, 16);
+
+        // Итоговый цвет: образец и код. Образец справа в строке Sat, код справа в строке Val
+        g.setColor(cur);
+        g.fillRect(w - 62, satY - 17, 42, font.getHeight() - 2);
+        g.setColor(0xFFFFFF);
+        g.drawRect(w - 62, satY - 17, 42, font.getHeight() - 2);
+        String hex = Integer.toHexString(cur).toUpperCase();
+        while (hex.length() < 6) hex = "0" + hex;
+        g.drawString("#" + hex, w - 20 - font.stringWidth("#" + hex), valY - 18, Graphics.TOP | Graphics.LEFT);
+        if (activeHsvControl == 0) {
+            g.drawString("Hue: " + hue, 8, top - 2, Graphics.TOP | Graphics.LEFT);
+        }
     }
 
     protected void keyPressed(int keyCode) {
@@ -3215,14 +3364,14 @@ private class ThemeCanvas extends Canvas {
             else if (ga == DOWN) { if (activeHsvControl < 2) activeHsvControl++; repaint(); return; }
  
             if (activeHsvControl == 0) {
-                if (ga == LEFT) hue = (hue - 15 + 360) % 360;
-                else if (ga == RIGHT) hue = (hue + 15) % 360;
+                if (ga == LEFT) hue = (hue - 6 + 360) % 360;
+                else if (ga == RIGHT) hue = (hue + 6) % 360;
             } else if (activeHsvControl == 1) {
-                if (ga == LEFT) sat = Math.max(0, sat - 15);
-                else if (ga == RIGHT) sat = Math.min(255, sat + 15);
+                if (ga == LEFT) sat = Math.max(0, sat - 8);
+                else if (ga == RIGHT) sat = Math.min(255, sat + 8);
             } else if (activeHsvControl == 2) {
-                if (ga == LEFT) val = Math.max(0, val - 15);
-                else if (ga == RIGHT) val = Math.min(255, val + 15);
+                if (ga == LEFT) val = Math.max(0, val - 8);
+                else if (ga == RIGHT) val = Math.min(255, val + 8);
             }
  
             if (ga == FIRE || keyCode == 10 || keyCode == 13 || keyCode == -5 || keyCode == -7) {
@@ -3306,24 +3455,19 @@ private class ThemeCanvas extends Canvas {
     }
 
     private void updateTouchColor(int x, int y) {
-        int w = getWidth(); int h = getHeight(); int cx = w / 2; int cy = h / 2 - 20;
+        int w = getWidth(); int h = getHeight();
         if (y >= h - 110 && y <= h - 80) {
             activeHsvControl = 1; sat = Math.max(0, Math.min(255, ((x - 20) * 255) / (w - 40)));
         } else if (y >= h - 70 && y <= h - 40) {
             activeHsvControl = 2; val = Math.max(0, Math.min(255, ((x - 20) * 255) / (w - 40)));
-        } else {
+        } else if (wR > 0) {
+            // Круг: угол даёт оттенок, расстояние от центра насыщенность. Палец может выходить за круг, значения ограничиваются
             activeHsvControl = 0;
-            int radius = Math.min(w, h) / 3 - 5;
-            if (radius < 10) radius = 40;
-            int bestAngle = 0; int minDistSq = Integer.MAX_VALUE;
-            for (int i = 0; i < 24; i++) {
-                int angle = i * 15;
-                int sx = cx + (getCos(angle) * (radius - 6)) / 1000;
-                int sy = cy + (getSin(angle) * (radius - 6)) / 1000;
-                int dx = x - sx; int dy = y - sy; int distSq = dx * dx + dy * dy;
-                if (distSq < minDistSq) { minDistSq = distSq; bestAngle = angle; }
-            }
-            hue = bestAngle;
+            int dx = x - wcx;
+            int dy = y - wcy;
+            hue = angleOf(dx, dy);
+            int dist = (int) Math.sqrt((double) (dx * dx + dy * dy));
+            sat = Math.min(255, (dist * 255) / wR);
         }
         repaint();
     }
@@ -3382,13 +3526,22 @@ private class ThemeCanvas extends Canvas {
         repaint();
     }
 
+    private int slotColor(int slot) {
+        if (slot == 0) return midlet.colorBg;
+        if (slot == 1) return midlet.colorMain;
+        if (slot == 2) return midlet.colorHeaderBg;
+        if (slot == 3) return midlet.colorFocusBg;
+        if (slot == 4) return midlet.colorSoftbarBg;
+        if (slot == 5) return midlet.colorWarn;
+        return midlet.colorError;
+    }
+
     private void handleSelection() {
         if (showPaletteMenu) {
-            if (selectedIdx == items.size() - 5) { showPaletteMenu = false; refreshThemeList(); }
-            else if (selectedIdx > items.size() - 5) {
-                targetSlot = selectedIdx - (items.size() - 4);
-                int currentRgb = (targetSlot == 0) ? midlet.colorBg : (targetSlot == 1) ? midlet.colorMain : (targetSlot == 2) ? midlet.colorWarn : midlet.colorError;
-                rgbToHsv(currentRgb); activeHsvControl = 0; isEditingColor = true;
+            if (selectedIdx == items.size() - (NSLOT + 1)) { showPaletteMenu = false; refreshThemeList(); }
+            else if (selectedIdx > items.size() - (NSLOT + 1)) {
+                targetSlot = selectedIdx - (items.size() - NSLOT);
+                rgbToHsv(slotColor(targetSlot)); activeHsvControl = 0; isEditingColor = true;
             }
             repaint();
             return;
@@ -3461,31 +3614,33 @@ private class ThemeCanvas extends Canvas {
         }
 
         int rgb = hsvToRgb(hue, sat, val);
+        // Шапка, нижняя панель и выделение следуют за фоном и основным цветом, пока их не задали вручную
+        int oldDerived = (midlet.colorBg == 0) ? 0x222222 : midlet.colorBg;
+        boolean headerFollows = (midlet.colorHeaderBg == oldDerived);
+        boolean softbarFollows = (midlet.colorSoftbarBg == oldDerived);
+        boolean focusFollows = (midlet.colorFocusBg == midlet.colorMain);
+
         if (targetSlot == 0) midlet.colorBg = rgb;
         else if (targetSlot == 1) midlet.colorMain = rgb;
-        else if (targetSlot == 2) midlet.colorWarn = rgb;
-        else if (targetSlot == 3) midlet.colorError = rgb;
-        midlet.colorHeaderBg = (midlet.colorBg == 0) ? 0x222222 : midlet.colorBg;
-        midlet.colorSoftbarBg = midlet.colorHeaderBg;
-        midlet.colorFocusBg = midlet.colorMain;
+        else if (targetSlot == 2) midlet.colorHeaderBg = rgb;
+        else if (targetSlot == 3) midlet.colorFocusBg = rgb;
+        else if (targetSlot == 4) midlet.colorSoftbarBg = rgb;
+        else if (targetSlot == 5) midlet.colorWarn = rgb;
+        else if (targetSlot == 6) midlet.colorError = rgb;
+
+        if (targetSlot == 0) {
+            int nd = (midlet.colorBg == 0) ? 0x222222 : midlet.colorBg;
+            if (headerFollows) midlet.colorHeaderBg = nd;
+            if (softbarFollows) midlet.colorSoftbarBg = nd;
+        }
+        if (targetSlot == 1 && focusFollows) midlet.colorFocusBg = midlet.colorMain;
         midlet.resetDynamicStatusColors();
         midlet.saveTheme(midlet.currentThemeName);
         refreshThemeList();
     }
 
     private int hsvToRgb(int h, int s, int v) {
-        float hf = h / 60.0f; int i = (int) Math.floor(hf); float f = hf - i;
-        float pv = v * (1.0f - (s / 255.0f)); float qv = v * (1.0f - (s / 255.0f) * f); float tv = v * (1.0f - (s / 255.0f) * (1.0f - f));
-        int r = 0, g = 0, b = 0;
-        switch (i) {
-            case 0: r = v; g = (int)tv; b = (int)pv; break;
-            case 1: r = (int)qv; g = v; b = (int)pv; break;
-            case 2: r = (int)pv; g = v; b = (int)tv; break;
-            case 3: r = (int)pv; g = (int)qv; b = v; break;
-            case 4: r = (int)tv; g = (int)pv; b = v; break;
-            default: r = v; g = (int)pv; b = (int)qv; break;
-        }
-        return ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+        return hsvInt(h, s, v);
     }
 }
 
@@ -4309,81 +4464,12 @@ private class TerminalCanvas extends Canvas {
                             }
                         }
  
-                        StringBuffer metaJson = new StringBuffer();
-                        metaJson.append("{\"prompt\":\"").append(escapeStatic(finalImagePrompt)).append("\",")
-                                .append("\"sys\":\"").append(escapeStatic(midlet.systemPrompt != null ? midlet.systemPrompt : "")).append("\",")
-                                .append("\"history\":").append(rawHistory != null ? rawHistory : "[]").append("}");
- 
-                        byte[] metaBytes = metaJson.toString().getBytes("UTF-8");
-                        int totalTextChunks = (metaBytes.length + chunkSize - 1) / chunkSize;
-                        if (totalTextChunks == 0) totalTextChunks = 1;
- 
-                        for (int i = 0; i < totalTextChunks; i++) {
-                            int start = i * chunkSize;
-                            int end = Math.min(start + chunkSize, metaBytes.length);
-                            byte[] chunkBuf = new byte[end - start];
-                            if (metaBytes.length > 0) {
-                                System.arraycopy(metaBytes, start, chunkBuf, 0, end - start);
-                            }
-                            boolean isTextFinal = (i == totalTextChunks - 1);
- 
-                            stage("meta " + (i + 1) + "/" + totalTextChunks + " (" + sizeStr(chunkBuf.length) + ")");
- 
-                            StringBuffer urlSb = new StringBuffer(proxyBase);
-                            urlSb.append("?sid=").append(sid)
-                                .append("&type=image_text_chunk")
-                                .append("&chat=").append(escapeUrl(chatName))
-                                .append("&prov=").append(midlet.selectedProvider)
-                                .append("&model=").append(escapeUrl(midlet.selectedModel))
-                                .append("&key=").append(escapeUrl(midlet.apiKey))
-                                .append("&chunk=").append(i + 1)
-                                .append("&total=").append(totalTextChunks)
-                                .append("&final=").append(isTextFinal ? "1" : "0");
- 
-                            c = (HttpConnection) Connector.open(urlSb.toString(), Connector.READ_WRITE, true);
-                            c.setRequestMethod(HttpConnection.POST);
-                            c.setRequestProperty("Content-Type", "application/octet-stream");
-                            c.setRequestProperty("User-Agent", "Omega-Symbian");
-                            String paramsHdr = midlet.paramsHeader();
-                            if (paramsHdr.length() > 0) {
-                                c.setRequestProperty("X-Omega-Params", paramsHdr);
-                            }
- 
-                            os = c.openOutputStream();
-                            os.write(chunkBuf);
-                            os.flush(); os.close();
-                            if (isTextFinal) stage("wait model via proxy");
- 
-                            is = c.openInputStream();
-                            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                            int ch; while ((ch = is.read()) != -1) bos.write(ch);
-                            is.close(); c.close();
- 
-                            if (!isTextFinal) {
-                                String ack = new String(bos.toByteArray(), "UTF-8").trim();
-                                if (!ack.equals("CHUNK_OK")) {
-                                    throw new Exception("meta chunk " + (i + 1) + ": " + (ack.length() > 100 ? ack.substring(0, 100) : ack));
-                                }
-                            }
- 
-                            if (isTextFinal) {
-                                String resp = new String(bos.toByteArray(), "UTF-8").trim();
-                                // Ошибки сервера и провайдера в историю чата не пишем: они сбивают модель в следующих запросах
-                                if (resp.startsWith("ERR:") || resp.startsWith("<!DOCTYPE") || resp.startsWith("<html")) {
-                                    throw new Exception(resp.length() > 200 ? resp.substring(0, 200) : resp);
-                                }
-                                final String finalResult = resp;
-                                stage("save chat");
-                                Omega.appendToChatRms(chatName, "[IMG] " + promptText, finalResult, modelAtSend);
-                                display.callSerially(new Runnable() {
-                                    public void run() {
-                                        isLoading = false; loadingStatusText = "[...]";
-                                        rebuildWrappedLines();
-                                        repaint();
-                                    }
-                                });
-                            }
-                        }
+                        // Картинка загружена. Дальше всё как у текстового сообщения: урезание контекста по лимиту,
+                        // потоковый ответ, сохранение в чат
+                        fileBytes = null;
+                        TerminalSender ts = new TerminalSender(finalImagePrompt, "[IMG] " + promptText, null, rawHistory, chatName, modelAtSend);
+                        ts.imgSid = sid;
+                        ts.run();
  
                     } catch (final Throwable t) {
                         final String st = loadingStatusText;
@@ -4757,7 +4843,7 @@ private class TerminalCanvas extends Canvas {
         g.setColor(midlet.colorMain);
         g.drawLine(0, h - bottomBarHeight, w, h - bottomBarHeight);
  
-        String leftBtnStr = fastMode ? "[EXIT FAST]" : "[MENU]";
+        String leftBtnStr = fastMode ? "[EXIT FAST]" : "[OPTIONS]";
         g.drawString(leftBtnStr, 10, h - 26, Graphics.TOP | Graphics.LEFT);
  
         String rightBtnStr = "[CONFIG]";
@@ -5875,15 +5961,7 @@ private class TerminalCanvas extends Canvas {
             int tapLine = (scroller.getPos() + (y - chatTopY)) / fhp;
             if (loadMoreLine >= 0 && tapLine == loadMoreLine) { loadMoreMessages(); return; }
             if (backLine >= 0 && tapLine == backLine) { backToLatest(); return; }
-            // Тап по своему вопросу: правка; по последнему ответу: перегенерация
-            int mk = messageAtLine(tapLine);
-            if (mk != -1 && tapLine < wrappedLines.size()
-                    && ((Integer) lineRoles.elementAt(tapLine)).intValue() != 2) {
-                int abs = ((Integer) msgAbsIdx.elementAt(mk)).intValue();
-                int mrole = ((Integer) msgRoleV.elementAt(mk)).intValue();
-                if (mrole == 0 && abs >= msgTotal - 2) { editLast(); return; }
-                if (mrole == 1 && abs == msgTotal - 1) { regenerate(); return; }
-            }
+            
         }
         if (!isLoading) openFullTextBox();
     }
@@ -6043,6 +6121,8 @@ private class TerminalSender implements Runnable {
     private int directAttempt = 1;     // номер попытки прямой отправки (повторяем при 429/502/503)
     private boolean retryDirect = false;
     private int retryCode = 0;
+    private String imgSid = null;      // номер сеанса, под которым на прокси уже загружена картинка (отправка через прокси)
+
 
     public TerminalSender(String p, String dispP, String img, String h, String cn, String model) {
         prm = p; dispPrm = dispP; base64Img = img; hist = h; cName = cn; mdl = model;
@@ -6060,7 +6140,7 @@ private class TerminalSender implements Runnable {
             byte[] histBytes = hist != null ? hist.getBytes("UTF-8") : new byte[0];
             int histSizeKb = histBytes.length / 1024;
  
-            if (midlet.proxyMode == 2 || (midlet.proxyMode == 1 && histSizeKb > 12)) {
+            if (imgSid != null || midlet.proxyMode == 2 || (midlet.proxyMode == 1 && histSizeKb > 12)) {
                 sendChatViaProxy(histBytes);
             } else {
                 // Временные отказы провайдера (429 лимит, 502/503 перегрузка): пробуем ещё до двух раз с паузой
@@ -6124,7 +6204,7 @@ private class TerminalSender implements Runnable {
         HttpConnection c = null;
         OutputStream os = null;
         InputStream is = null;
-        final boolean wantStream = midlet.isStreamOn() && (base64Img == null || base64Img.length() == 0);
+        final boolean wantStream = midlet.isStreamOn();
         final String streamFlag = wantStream ? "true" : "false";
         try {
             String url = CHAT_URLS[midlet.selectedProvider];
@@ -6176,7 +6256,7 @@ private class TerminalSender implements Runnable {
                     }
                 }
                 ollamaPrompt.append("User: ").append(prm).append("\nAssistant:");
-                body.write(("{\"model\":\"" + midlet.selectedModel + "\",\"prompt\":\"" + escape(ollamaPrompt.toString()) + "\",\"stream\":" + streamFlag + midlet.paramsJson(0) + "}").getBytes("UTF-8"));
+                body.write(("{\"model\":\"" + midlet.selectedModel + "\",\"prompt\":\"" + escape(ollamaPrompt.toString()) + "\",\"stream\":" + streamFlag + ((base64Img != null && base64Img.length() > 0) ? ",\"images\":[\"" + base64Img + "\"]" : "") + midlet.paramsJson(0) + "}").getBytes("UTF-8"));
  
             } else { // OpenAI-совместимые (VoidAI, OpenCode, GroqCloud, OpenRouter)
                 StringBuffer msgs = new StringBuffer("[");
@@ -6442,7 +6522,7 @@ private String stripTags(String s) {
             int chunkSize = 8192;
             int totalChunks = (totalLen + chunkSize - 1) / chunkSize;
  
-            final String sid = "omega_chat_" + System.currentTimeMillis();
+            final String sid = (imgSid != null) ? imgSid : "omega_chat_" + System.currentTimeMillis();
             String proxyBase = midlet.proxyUrl;
             if (proxyBase == null || proxyBase.trim().length() == 0) {
                 throw new Exception("Proxy URL is not set!");
@@ -6470,6 +6550,7 @@ private String stripTags(String s) {
                                   "&final=" + (isFinal ? "1" : "0") +
                                   "&prov=" + midlet.selectedProvider +
                                   (wantStream ? "&stream=1" : "") +
+                                  (imgSid != null ? "&img=1" : "") +
                                   (trimmed ? "&trim=1" : "");
  
                 String resp = "";
