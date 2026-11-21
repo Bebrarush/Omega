@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import threading
 import time
@@ -10,6 +11,10 @@ from urllib.parse import quote, unquote
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
+
+# Ключи API ездят в адресах запросов, поэтому журнал адресов httpx (в нём видны и ключи) отключаем
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 app = FastAPI()
 
@@ -107,6 +112,7 @@ def note_request(request: Request, req_type: Optional[str]) -> None:
 
 # Обновление приложения с GitHub: файлы берутся только с raw.githubusercontent.com и только по проверенным именам
 GITHUB_RAW = "https://raw.githubusercontent.com"
+GITHUB_SITE = "https://github.com"
 MAX_JAR = 4_000_000
 
 
@@ -125,10 +131,18 @@ def update_params(q) -> Optional[dict]:
         return None
     if not name or not _ok(name, "_.-", 60):
         return None
-    return {"repo": repo, "branch": branch, "folder": folder, "name": name}
+    src = "raw" if (q.get("src") or "release").strip().lower() == "raw" else "release"
+    tag = (q.get("tag") or "").strip()
+    if not _ok(tag, "_.-", 60):
+        return None
+    return {"repo": repo, "branch": branch, "folder": folder, "name": name, "src": src, "tag": tag}
 
 
 def update_file_url(p: dict, ext: str) -> str:
+    if p.get("src") != "raw":
+        # Файлы релиза: последний релиз или конкретный тег
+        rel = "latest/download" if not p.get("tag") else "download/" + quote(p["tag"], safe="")
+        return "{}/{}/releases/{}/{}".format(GITHUB_SITE, quote(p["repo"], safe="/"), rel, quote(p["name"] + ext))
     parts = [p["repo"], p["branch"]] + ([p["folder"]] if p["folder"] else []) + [p["name"] + ext]
     return GITHUB_RAW + "/" + "/".join(quote(x, safe="/") for x in parts)
 
@@ -373,7 +387,7 @@ async def send_image_to_network(prov: int, model: str, api_key: str, prompt: str
 
 def build_chat_request(prov: int, model: str, api_key: str, system_prompt: str,
                        history_json_str: str, params: Optional[dict] = None,
-                       fallbacks: Optional[list] = None):
+                       fallbacks: Optional[list] = None, image: Optional[tuple] = None):
     """Адрес, заголовки и тело запроса к провайдеру (stream выключен: потоковый режим включает вызывающий)."""
     headers = make_headers(api_key)
     # strict=False: в старых чатах клиента могли остаться «сырые» табы и переводы строк внутри текста
@@ -388,12 +402,23 @@ def build_chat_request(prov: int, model: str, api_key: str, system_prompt: str,
         payload = {"model": model, "prompt": prompt_text, "stream": False}
         if system_prompt:
             payload["system"] = system_prompt
+        if image:
+            payload["images"] = [image[0]]
     else:
         endpoint = CHAT_ENDPOINTS.get(prov, DEFAULT_CHAT_ENDPOINT)
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.extend(history)
+        if image:
+            # Картинка прикладывается к последнему вопросу пользователя
+            for idx in range(len(messages) - 1, -1, -1):
+                if messages[idx].get("role") == "user":
+                    messages[idx] = {"role": "user", "content": [
+                        {"type": "text", "text": messages[idx]["content"]},
+                        {"type": "image_url", "image_url": {"url": f"data:{image[1]};base64,{image[0]}"}},
+                    ]}
+                    break
         payload = {"model": model, "messages": messages, "stream": False}
         if prov == 4 and fallbacks:
             payload["models"] = list(fallbacks)   # OpenRouter сам пробует их по очереди, если основная модель недоступна
@@ -402,10 +427,18 @@ def build_chat_request(prov: int, model: str, api_key: str, system_prompt: str,
     return endpoint, headers, payload
 
 
+def mark_image_sent(sent: list) -> list:
+    """Для сохранения в чат: последнему вопросу, к которому приложена картинка, возвращается пометка [IMG]."""
+    out = list(sent)
+    if out and isinstance(out[-1], dict) and isinstance(out[-1].get("content"), str):
+        out[-1] = dict(out[-1], content="[IMG] " + out[-1]["content"])
+    return out
+
+
 async def send_chat_to_network(prov: int, model: str, api_key: str, system_prompt: str,
                                history_json_str: str, params: Optional[dict] = None,
-                               fallbacks: Optional[list] = None) -> str:
-    endpoint, headers, payload = build_chat_request(prov, model, api_key, system_prompt, history_json_str, params, fallbacks)
+                               fallbacks: Optional[list] = None, image: Optional[tuple] = None) -> str:
+    endpoint, headers, payload = build_chat_request(prov, model, api_key, system_prompt, history_json_str, params, fallbacks, image)
     return await post_to_provider(endpoint, headers, payload, prov, "Empty response")
 
 
@@ -472,11 +505,11 @@ def parse_stream_line(line: str, prov: int):
 
 def run_stream_job(sid: str, prov: int, model: str, api_key: str, system_prompt: str,
                    full_payload: str, params: dict, chat_name: str, trimmed: bool,
-                   fallbacks: Optional[list] = None) -> None:
+                   fallbacks: Optional[list] = None, image: Optional[tuple] = None) -> None:
     """Фоновый поток: читает потоковый ответ провайдера и складывает текст в streams[sid]."""
     st = streams[sid]
     try:
-        endpoint, headers, payload = build_chat_request(prov, model, api_key, system_prompt, full_payload, params, fallbacks)
+        endpoint, headers, payload = build_chat_request(prov, model, api_key, system_prompt, full_payload, params, fallbacks, image)
         payload["stream"] = True
         got_text = False
         raw: list[str] = []
@@ -536,6 +569,8 @@ def run_stream_job(sid: str, prov: int, model: str, api_key: str, system_prompt:
                     sent = []
             except Exception:
                 sent = []
+            if image:
+                sent = mark_image_sent(sent)
             save_reply_to_chat(chat_name, sent, model, text_all, trimmed)
         st["state"] = "D"
     except Exception as err:
@@ -601,6 +636,16 @@ async def handler(request: Request, path: str = ""):
                     return text_response("ERR: JAR is too large", 502)
                 return Response(res.content, media_type="application/java-archive")
             res = await fetch_github(update_file_url(params, ".jad"))
+            if res.status_code == 404 and kind == "update":
+                # JAD в репозитории нет: версию берём из манифеста самого JAR
+                jres = await fetch_github(update_file_url(params, ".jar"))
+                if jres.status_code != 200 or len(jres.content) > MAX_JAR:
+                    return text_response(f"ERR: no JAD and no JAR (GitHub HTTP {jres.status_code})", 502)
+                import io
+                import zipfile
+                with zipfile.ZipFile(io.BytesIO(jres.content)) as zf:
+                    mf = zf.read("META-INF/MANIFEST.MF").decode("utf-8", "replace")
+                return text_response("OK\n" + mf)
             if res.status_code != 200:
                 return text_response(f"ERR: GitHub HTTP {res.status_code}", 502)
             jad = res.content.decode("utf-8", "replace")
@@ -610,9 +655,9 @@ async def handler(request: Request, path: str = ""):
             if not base.startswith(("http://", "https://")):
                 host = request.headers.get("host") or ""
                 base = ("https://" + host) if host else ""
-            jar_url = "{}/{}.jar?type=jar&repo={}&branch={}&folder={}&name={}".format(
-                base, params["name"], quote(params["repo"], safe="/"), quote(params["branch"], safe="/"),
-                quote(params["folder"], safe="/"), quote(params["name"]))
+            jar_url = "{}/{}.jar?type=jar&repo={}&src={}&tag={}&branch={}&folder={}&name={}".format(
+                base, params["name"], quote(params["repo"], safe="/"), params["src"], quote(params["tag"], safe=""),
+                quote(params["branch"], safe="/"), quote(params["folder"], safe="/"), quote(params["name"]))
             return Response(rewrite_jad(jad, jar_url).encode("utf-8"), media_type="text/vnd.sun.j2me.app-descriptor")
         except Exception as err:
             return text_response(f"ERR: {err}", 502)
@@ -732,6 +777,13 @@ async def handler(request: Request, path: str = ""):
             full_payload = body.decode("utf-8")
             trimmed = q.get("trim") == "1"
 
+            # Запрос с картинкой: она уже загружена кусками под этим же sid (type=image_chunk)
+            image = None
+            if q.get("img") == "1":
+                check_chunks(sess["chunks"], sess["img_total"], "image")
+                img_bytes = join_chunks(sess["chunks"])
+                image = (base64.b64encode(img_bytes).decode("ascii"), sniff_mime(img_bytes))
+
             if q.get("stream") == "1":
                 # Потоковый режим: запускаем фоновый поток и сразу отвечаем, текст клиент заберёт через type=poll
                 prune_streams()
@@ -739,13 +791,18 @@ async def handler(request: Request, path: str = ""):
                                 "lock": threading.Lock(), "ts": time.time()}
                 threading.Thread(
                     target=run_stream_job,
-                    args=(sid, prov, model, api_key, system_prompt, full_payload, params, chat_name, trimmed, fallbacks),
+                    args=(sid, prov, model, api_key, system_prompt, full_payload, params, chat_name, trimmed, fallbacks, image),
                     daemon=True,
                 ).start()
                 sessions.pop(sid, None)
                 return text_response("STREAM_OK")
 
-            ai_response = await send_chat_to_network(prov, model, api_key, system_prompt, full_payload, params, fallbacks)
+            try:
+                ai_response = await send_chat_to_network(prov, model, api_key, system_prompt, full_payload, params, fallbacks, image)
+            except RuntimeError as err:
+                if image:
+                    raise RuntimeError(f"{err} [img {len(img_bytes)} B, {image[1]}]") from err
+                raise
 
             try:
                 sent = json.loads(full_payload, strict=False)
@@ -753,6 +810,8 @@ async def handler(request: Request, path: str = ""):
                     sent = []
             except Exception:
                 sent = []
+            if image:
+                sent = mark_image_sent(sent)
             save_reply_to_chat(chat_name, sent, model, ai_response, trimmed)
 
             sessions.pop(sid, None)
