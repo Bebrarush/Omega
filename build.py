@@ -1,9 +1,10 @@
 #Run this script directly or run it from the command line
 #in the same folder where Omega.java is located.
-
-
+import argparse
 import os
+import re
 import subprocess
+import sys
 import urllib.request
 import zipfile
 import shutil
@@ -12,11 +13,101 @@ APP_NAME = "Omega"
 JAVA_FILE = f"{APP_NAME}.java"
 CLASSES_DIR = "build_classes"
 LIB_DIR = "lib"
+DEFAULT_VERSION = "1.0.0"
 
 CLDC_JAR_URL = "https://repo1.maven.org/maven2/org/microemu/cldcapi11/2.0.3/cldcapi11-2.0.3.jar"
 MIDP_JAR_URL = "https://repo1.maven.org/maven2/org/microemu/microemu-midp/2.0.4/microemu-midp-2.0.4.jar"
 JSR75_JAR_URL = "https://repo1.maven.org/maven2/org/microemu/microemu-jsr-75/2.0.4/microemu-jsr-75-2.0.4.jar"
 PROGUARD_JAR_URL = "https://repo1.maven.org/maven2/net/sf/proguard/proguard/4.4/proguard-4.4.jar"
+
+# Строка с версией в окне About внутри Omega.java: new Form("Omega v1.0.9")
+ABOUT_RE = re.compile(r'(new\s+Form\(\s*")Omega v[^"]*("\s*\))')
+VERSION_RE = re.compile(r"^\s*MIDlet-Version\s*:\s*(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+# ---------- Версия ----------
+
+def version_tuple(v):
+    nums = [int(x) for x in re.findall(r"\d+", v)]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+def read_jad_version(path):
+    """Версия из готового .jad (MIDlet-Version) или None, если файла нет или версии в нём нет."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        text = f.read().decode("iso-8859-1")
+    m = VERSION_RE.search(text)
+    return m.group(1) if m else None
+
+
+def read_java_version():
+    """Версия из строки About в Omega.java (например Omega v1.0.9 или v1.09) или None."""
+    if not os.path.exists(JAVA_FILE):
+        return None
+    with open(JAVA_FILE, "r", encoding="utf-8", errors="replace") as f:
+        m = re.search(r'new\s+Form\(\s*"Omega v([^"]*)"\s*\)', f.read())
+    return m.group(1) if m else None
+
+
+def current_version():
+    """Самая свежая версия из .jad обеих сборок; если их нет, то из Omega.java; иначе по умолчанию."""
+    found = []
+    for name in (f"{APP_NAME}.jad", f"{APP_NAME}_s40_fix.jad"):
+        v = read_jad_version(name)
+        if v:
+            found.append(v)
+    if found:
+        return max(found, key=version_tuple)
+    jv = read_java_version()
+    if jv:
+        nums = re.findall(r"\d+", jv)
+        # Старый формат "1.09" читаем как 1.0.9
+        if len(nums) == 2 and len(nums[1]) == 2:
+            return f"{nums[0]}.{nums[1][0]}.{int(nums[1][1])}"
+        return ".".join(nums) if nums else DEFAULT_VERSION
+    return DEFAULT_VERSION
+
+
+def bump(v):
+    parts = [int(x) for x in re.findall(r"\d+", v)] or [1, 0, 0]
+    while len(parts) < 3:
+        parts.append(0)
+    parts[-1] += 1
+    return ".".join(str(p) for p in parts)
+
+
+def write_java_version(ver):
+    """Меняет цифру версии в строке About файла Omega.java. Возвращает True, если строка найдена."""
+    with open(JAVA_FILE, "r", encoding="utf-8", errors="replace", newline="") as f:
+        src = f.read()
+    new_src, n = ABOUT_RE.subn(lambda m: f'{m.group(1)}Omega v{ver}{m.group(2)}', src, count=1)
+    if n == 0:
+        return False
+    with open(JAVA_FILE, "w", encoding="utf-8", newline="") as f:
+        f.write(new_src)
+    return True
+
+
+def choose_version(args):
+    cur = current_version()
+    if args.version:
+        return args.version
+    if args.bump:
+        return bump(cur)
+    if args.no_bump or not sys.stdin.isatty():
+        return cur
+    nxt = bump(cur)
+    ans = input(f"Текущая версия {cur}. Поднять до {nxt}? [y = да / N = нет, оставить {cur} / или введи свою]: ").strip()
+    if ans.lower() in ("y", "yes", "д", "да"):
+        return nxt
+    if re.fullmatch(r"\d+(\.\d+){1,3}", ans):
+        return ans
+    return cur
+
+
+# ---------- Зависимости ----------
 
 def download_deps():
     os.makedirs(LIB_DIR, exist_ok=True)
@@ -42,20 +133,19 @@ def download_deps():
 
     return cldc_path, midp_path, jsr75_path, proguard_path
 
-def create_jar(jar_name, target_dir, wtk_style=False, is_s40=False):
-    jad_name = jar_name.replace(".jar", ".jad")
-    
-    # Базовые атрибуты для всех
+
+# ---------- Сборка ----------
+
+def manifest_attributes(version, is_s40):
     attributes = [
         ("Manifest-Version", "1.0"),
         ("Created-By", "1.0 (Sun Microsystems Inc.)"),
         ("MIDlet-Name", APP_NAME),
-        ("MIDlet-Version", "1.0.8"),
+        ("MIDlet-Version", version),
         ("MIDlet-Vendor", "Bebrarush"),
         ("MicroEdition-Profile", "MIDP-2.0"),
         ("MicroEdition-Configuration", "CLDC-1.1"),
     ]
-
     if is_s40:
         # Строгий набор для S40 без лишних тач-тегов, ломающих валидатор
         attributes.append(("MIDlet-1", f"{APP_NAME}, icon.png, {APP_NAME}"))
@@ -70,10 +160,16 @@ def create_jar(jar_name, target_dir, wtk_style=False, is_s40=False):
             ("MIDlet-Permissions", "javax.microedition.io.Connector.file.read,javax.microedition.io.Connector.file.write"),
             ("MIDlet-Permissions-Opt", "javax.microedition.io.Connector.http"),
         ])
+    return attributes
+
+
+def create_jar(jar_name, target_dir, version, wtk_style=False, is_s40=False, write_jad=True):
+    jad_name = jar_name.replace(".jar", ".jad")
+    attributes = manifest_attributes(version, is_s40)
 
     manifest_lines = [f"{k}: {v}" for k, v in attributes]
-    manifest_lines.append("") # Пустая строка в конце обязательна
-    
+    manifest_lines.append("")  # Пустая строка в конце обязательна
+
     # Строго бинарная запись в iso-8859-1 без дублирования \r\r\n
     manifest_bytes = "\r\n".join(manifest_lines).encode("iso-8859-1")
 
@@ -100,14 +196,18 @@ def create_jar(jar_name, target_dir, wtk_style=False, is_s40=False):
         else:
             for root, dirs, files in os.walk(target_dir):
                 for file in files:
+                    if file.upper() == "MANIFEST.MF" and os.path.basename(root).upper() == "META-INF":
+                        continue  # манифест уже записан выше
                     full_path = os.path.join(root, file)
-                    arcname = os.path.relpath(full_path, target_dir)
+                    arcname = os.path.relpath(full_path, target_dir).replace("\\", "/")
                     jar.write(full_path, arcname)
 
             for file in os.listdir("."):
                 if file.lower().endswith(".png"):
                     jar.write(file, file)
 
+    if not write_jad:
+        return
     jar_size = os.path.getsize(jar_name)
     jad_lines = [f"{k}: {v}" for k, v in attributes]
     jad_lines.append(f"MIDlet-Jar-URL: {jar_name}")
@@ -118,13 +218,76 @@ def create_jar(jar_name, target_dir, wtk_style=False, is_s40=False):
     with open(jad_name, "wb") as f:
         f.write(jad_bytes)
 
+
+def build_variant(final_jar, version, proguard, bootclasspath, is_s40, wtk_style):
+    """Одна сборка: сырой jar, преверификация ProGuard (обязательна), финальная упаковка. True при успехе."""
+    tag = final_jar.replace(".jar", "")
+    temp_raw = f"{tag}_temp_raw.jar"
+    pre_jar = f"{tag}_preverified.jar"
+    extract_dir = f"build_{tag}"
+
+    create_jar(temp_raw, CLASSES_DIR, version, wtk_style=False, is_s40=is_s40, write_jad=False)
+
+    print(f"[-] Преверификация ProGuard: {final_jar}...")
+    pg_cmd = [
+        "java", "-jar", proguard,
+        "-injars", temp_raw,
+        "-outjars", pre_jar,
+        "-libraryjars", bootclasspath,
+        "-microedition",
+        "-dontobfuscate",
+        "-dontshrink",
+        "-dontoptimize",
+        "-keep", f"public class {APP_NAME} extends javax.microedition.midlet.MIDlet {{ public *; }}"
+    ]
+    pg_res = subprocess.run(pg_cmd, capture_output=True, text=True)
+    if os.path.exists(temp_raw):
+        os.remove(temp_raw)
+
+    if pg_res.returncode != 0 or not os.path.exists(pre_jar):
+        print(f"[!] Ошибка ProGuard для {final_jar} (сборка без преверификации не выпускается):\n", pg_res.stderr or pg_res.stdout)
+        if os.path.exists(pre_jar):
+            os.remove(pre_jar)
+        return False
+
+    if os.path.exists(extract_dir):
+        shutil.rmtree(extract_dir)
+    os.makedirs(extract_dir, exist_ok=True)
+    with zipfile.ZipFile(pre_jar, "r") as zf:
+        zf.extractall(extract_dir)
+    os.remove(pre_jar)
+
+    create_jar(final_jar, extract_dir, version, wtk_style=wtk_style, is_s40=is_s40)
+    shutil.rmtree(extract_dir)
+    print(f"[+] Готово: {final_jar} + {tag}.jad (версия {version}, преверифицирован)")
+    return True
+
+
 def main():
-    print(f"=== Omega Ultimate Builder ===")
+    parser = argparse.ArgumentParser(description="Сборка Omega: Symbian (Omega.jar) и S40 (Omega_s40_fix.jar), обе с преверификацией")
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--bump", action="store_true", help="поднять версию без вопроса")
+    g.add_argument("--no-bump", action="store_true", help="оставить текущую версию без вопроса")
+    g.add_argument("--version", help="задать версию вручную, например 1.1.0")
+    args = parser.parse_args()
+
+    print("=== Omega Ultimate Builder ===")
     if not os.path.exists(JAVA_FILE):
         print(f"[!] Ошибка: {JAVA_FILE} не найден!")
         return
 
-    if os.path.exists(CLASSES_DIR): shutil.rmtree(CLASSES_DIR)
+    version = choose_version(args)
+    print(f"[i] Версия сборки: {version}")
+
+    # Версия в окне About меняется только когда она действительно изменилась, и до компиляции
+    if read_java_version() != version:
+        if write_java_version(version):
+            print(f'[+] В {JAVA_FILE} обновлена строка new Form("Omega v{version}")')
+        else:
+            print(f'[!] В {JAVA_FILE} не найдена строка new Form("Omega v...") - версия в About не изменена')
+
+    if os.path.exists(CLASSES_DIR):
+        shutil.rmtree(CLASSES_DIR)
     os.makedirs(CLASSES_DIR, exist_ok=True)
 
     cldc, midp, jsr75, proguard = download_deps()
@@ -145,48 +308,14 @@ def main():
         print("[!] Ошибка javac:\n", res.stderr)
         return
 
-    # 1. Сборка стандартного Omega.jar для Symbian / S60 (без изменений и без фиксов S40)
-    create_jar("Omega.jar", CLASSES_DIR, wtk_style=False, is_s40=False)
-    print("[+] Собрано: Omega.jar (для Symbian/S60)")
+    ok_sym = build_variant(f"{APP_NAME}.jar", version, proguard, bootclasspath, is_s40=False, wtk_style=False)
+    ok_s40 = build_variant(f"{APP_NAME}_s40_fix.jar", version, proguard, bootclasspath, is_s40=True, wtk_style=True)
 
-    # 2. Создаем сырой jar для преверификации ProGuard под S40
-    temp_raw_jar = "temp_raw.jar"
-    create_jar(temp_raw_jar, CLASSES_DIR, wtk_style=False, is_s40=True)
-
-    print("[-] Выполнение преверификации через ProGuard для S40...")
-    pg_cmd = [
-        "java", "-jar", proguard,
-        "-injars", temp_raw_jar,
-        "-outjars", "Omega_s40_fix_raw.jar",
-        "-libraryjars", bootclasspath,
-        "-microedition",
-        "-dontobfuscate",
-        "-dontshrink",
-        "-dontoptimize",
-        "-keep", f"public class {APP_NAME} extends javax.microedition.midlet.MIDlet {{ public *; }}"
-    ]
-    
-    pg_res = subprocess.run(pg_cmd, capture_output=True, text=True)
-    if os.path.exists(temp_raw_jar): os.remove(temp_raw_jar)
-
-    if pg_res.returncode == 0 and os.path.exists("Omega_s40_fix_raw.jar"):
-        print("[-] Финальная WTK-упаковка с детерминированной структурой под S40...")
-        extract_dir = "build_fixed"
-        if os.path.exists(extract_dir): shutil.rmtree(extract_dir)
-        os.makedirs(extract_dir, exist_ok=True)
-        
-        with zipfile.ZipFile("Omega_s40_fix_raw.jar", "r") as zf:
-            zf.extractall(extract_dir)
-        
-        if os.path.exists("Omega_s40_fix_raw.jar"): 
-            os.remove("Omega_s40_fix_raw.jar")
-            
-        # Создаем итоговый файл Omega_s40_fix.jar по строгим стандартам WTK для S40
-        create_jar("Omega_s40_fix.jar", extract_dir, wtk_style=True, is_s40=True)
-        shutil.rmtree(extract_dir)
-        print("[+] Успешно создана финальная версия: Omega_s40_fix.jar (WTK-compliant для S40)")
+    if ok_sym and ok_s40:
+        print("[+] Обе сборки готовы. Для обновления по воздуху загрузи в релиз GitHub оба .jar и оба .jad.")
     else:
-        print("[!] Ошибка ProGuard:\n", pg_res.stderr)
+        print("[!] Часть сборок не создана, смотри ошибки выше.")
+
 
 if __name__ == "__main__":
     main()
