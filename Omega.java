@@ -2158,30 +2158,82 @@ private class CustomSelectCanvas extends Canvas {
         ensureSelVisible();
     }
 
-        // Удаление чата на сервере. Сначала обычный запрос, потом проверка по списку чатов: если чат всё ещё
-    // на сервере (так бывает на телефонах с патчем виртуальной машины), пробуем другие способы по очереди
-    private void deleteChatOnServer(String cName) {
+    private String delStage = "";                           // где сейчас застрял запрос (для диагностики)
+ 
+    // Каждый запрос идёт в своём потоке с ограничением по времени: если телефон завис на открытии соединения,
+    // этот поток бросаем и пробуем следующий способ. Возвращает пустую строку, текст ошибки или "timeout"
+    private String limitedSend(final String base, final String cName, final int mode) {
+        final String[] res = new String[1];
+        final boolean[] fin = new boolean[1];
+        new Thread(new Runnable() {
+            public void run() {
+                String e = sendDeleteRequest(base, cName, mode);
+                synchronized (res) { res[0] = e; fin[0] = true; res.notifyAll(); }
+            }
+        }).start();
+        synchronized (res) {
+            long end = System.currentTimeMillis() + 8000;
+            while (!fin[0]) {
+                long left = end - System.currentTimeMillis();
+                if (left <= 0) break;
+                try { res.wait(left); } catch (InterruptedException e) {}
+            }
+        }
+        return fin[0] ? res[0] : "timeout@" + delStage;
+    }
+ 
+    // То же для проверки по списку чатов: 1 есть, 0 нет, -1 не удалось (в том числе по времени)
+    private int limitedCheck(final String base, final String cName) {
+        final int[] res = new int[1];
+        final boolean[] fin = new boolean[1];
+        new Thread(new Runnable() {
+            public void run() {
+                int r = chatOnServer(base, cName);
+                synchronized (res) { res[0] = r; fin[0] = true; res.notifyAll(); }
+            }
+        }).start();
+        synchronized (res) {
+            long end = System.currentTimeMillis() + 8000;
+            while (!fin[0]) {
+                long left = end - System.currentTimeMillis();
+                if (left <= 0) break;
+                try { res.wait(left); } catch (InterruptedException e) {}
+            }
+        }
+        return fin[0] ? res[0] : -1;
+    }
+ 
+    // Порядок способов: сначала GET только на чтение (так же ходит рабочий запрос списка чатов), потом остальные.
+    // Номера соответствуют режимам в sendDeleteRequest: 1 GET-R, 0 GET, 2 POST, 3 DELETE
+    private void deleteChatOnServer(final String cName) {
         if (midlet.proxyUrl == null || midlet.proxyUrl.trim().length() == 0) { showDelInfo(cName, "server: no proxy URL"); return; }
         String base = midlet.proxyUrl.trim();
         if (base.endsWith("/")) base = base.substring(0, base.length() - 1);
+        delStage = "start";
+        showDelInfo(cName, "server: sending...");
+        int[] order = { 1, 0, 2, 3 };
         String[] names = { "GET", "GET-R", "POST", "DELETE" };
         StringBuffer trace = new StringBuffer();
-        for (int mode = 0; mode < 4; mode++) {
-            String err = sendDeleteRequest(base, cName, mode);
-            int st = chatOnServer(base, cName);
+        for (int n = 0; n < order.length; n++) {
+            int mode = order[n];
+            String err = limitedSend(base, cName, mode);
+            int st = limitedCheck(base, cName);
             if (st == 0) { showDelInfo(cName, "server: ok (" + names[mode] + ")"); return; }
-            if (st == -1) { showDelInfo(cName, "server: check failed (" + names[mode] + (err.length() > 0 ? " " + err : "") + ")"); return; }
+            if (st == -1 && !err.startsWith("timeout")) { showDelInfo(cName, "server: check failed (" + names[mode] + (err.length() > 0 ? " " + err : "") + ")"); return; }
             trace.append(names[mode]).append(err.length() > 0 ? ":" + err : ":sent").append(' ');
         }
         showDelInfo(cName, "server: NOT deleted [" + trace.toString().trim() + "]");
     }
-
+ 
+    // Показывает итог под списком. Прежний текст "server: ..." заменяется новым
     private void showDelInfo(final String cName, final String info) {
         midlet.display.callSerially(new Runnable() {
             public void run() {
-                // Только если уведомление об этом чате ещё на экране
                 if (currentDeletedNotice.length() > 0 && currentDeletedNotice.indexOf(cName) >= 0) {
-                    currentDeletedNotice = currentDeletedNotice + " " + info;
+                    String cur = currentDeletedNotice;
+                    int k = cur.indexOf(" server:");
+                    if (k >= 0) cur = cur.substring(0, k);
+                    currentDeletedNotice = cur + " " + info;
                     repaint();
                 }
             }
@@ -2196,6 +2248,7 @@ private class CustomSelectCanvas extends Canvas {
         String err = "";
         try {
             String url = base + "/?type=delete&chat=" + midlet.escapeUrl(cName);
+            delStage = "open " + mode;
             if (mode == 0) {
                 c = (HttpConnection) Connector.open(url);
                 c.setRequestMethod(HttpConnection.GET);
@@ -2220,8 +2273,10 @@ private class CustomSelectCanvas extends Canvas {
                 c.setRequestMethod("DELETE");
                 c.setRequestProperty("Connection", "close");
             }
+            delStage = "reply " + mode;
             int rc = c.getResponseCode();
             if (rc != 200) err = "HTTP" + rc;
+            delStage = "read " + mode;
             is = c.openInputStream();
             while (is.read() != -1) { }        // дочитываем ответ до конца, чтобы запрос точно завершился
         } catch (Throwable e) {
@@ -2241,10 +2296,13 @@ private class CustomSelectCanvas extends Canvas {
         HttpConnection c = null;
         InputStream is = null;
         try {
+            delStage = "list open";
             c = (HttpConnection) Connector.open(base + "/?type=list", Connector.READ);
             c.setRequestMethod(HttpConnection.GET);
             c.setRequestProperty("User-Agent", "Omega-Symbian");
+            delStage = "list reply";
             if (c.getResponseCode() != HttpConnection.HTTP_OK) return -1;
+            delStage = "list read";
             is = c.openInputStream();
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             int ch;
@@ -2538,7 +2596,10 @@ private void handleDeleteChat(final int index) {
  
         // Удаляем с сервера асинхронно (с проверкой и запасными способами)
         new Thread(new Runnable() {
-            public void run() { deleteChatOnServer(cName); }
+            public void run() {
+                try { deleteChatOnServer(cName); }
+                catch (Throwable e) { showDelInfo(cName, "server: crash " + e); }
+            }
         }).start();
  
         deleteState = 0;
@@ -2902,7 +2963,7 @@ private class ConfigCanvas extends Canvas {
         } else if (focusIndex == 9) {
             midlet.switchToThemes();
         } else if (focusIndex == 10) {
-            Form aboutForm = new Form("Omega v1.0.10");
+            Form aboutForm = new Form("Omega v1.0.11");
             aboutForm.append(new StringItem("", "Universal J2ME AI Client.\n"));
             
             aboutForm.append(new StringItem("Shortcuts:", "- D-Pad Up / Down: Scroll\n- Fire: Full text input\n- Left Softkey: Chat / Select\n- Right Softkey: Exit / Back\n- Key '0': Delete chat\n"));
