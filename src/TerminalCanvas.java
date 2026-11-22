@@ -170,6 +170,61 @@ class TerminalCanvas extends Canvas {
         repToken++;
     }
 
+    // Показывает экран чата сразу с пометкой о загрузке, а саму историю открывает чуть позже, уже на экране.
+    // Пока чат открывается, в RMS лежит метка: если телефон убьёт мидлет по памяти, при следующем запуске чат не откроется сам
+    void loadSoon(final String cName) {
+        chatName = cName;
+        wrappedLines.removeAllElements();
+        lineRoles.removeAllElements();
+        lineStyles.removeAllElements();
+        msgLineStart.removeAllElements();
+        msgAbsIdx.removeAllElements();
+        msgRoleV.removeAllElements();
+        loadMoreLine = -1;
+        backLine = -1;
+        msgTotal = 0;
+        wrappedLines.addElement("[ loading chat... ]");
+        lineRoles.addElement(new Integer(4));
+        lineStyles.addElement(MdLayout.NONE);
+        repaint();
+        new Thread(new Runnable() {
+            public void run() {
+                try { Thread.sleep(300); } catch (Exception e) {}
+                midlet.display.callSerially(new Runnable() {
+                    public void run() { openChatNow(cName); }
+                });
+            }
+        }).start();
+    }
+
+    private void openChatNow(String cName) {
+        if (chatName == null || !chatName.equals(cName)) return;       // пока ждали, пользователь ушёл в другой чат
+        midlet.bootMark("open chat");
+        Omega.writeSmall("OmegaGuard", cName);
+        try {
+            initChatSession(cName);
+            midlet.bootMark("chat opened");
+        } catch (Throwable t) {
+            // Не хватило памяти: чат остаётся в хранилище нетронутым, а экран сообщает об этом
+            wrappedLines.removeAllElements();
+            lineRoles.removeAllElements();
+            lineStyles.removeAllElements();
+            msgLineStart.removeAllElements();
+            msgAbsIdx.removeAllElements();
+            msgRoleV.removeAllElements();
+            loadMoreLine = -1;
+            backLine = -1;
+            msgTotal = 0;
+            wrapTextIntoVector("Sys: Could not open chat (" + t + "). Not enough memory? Choose another chat or start a new one.", Omega.uiFont(), getWidth() - 6, wrappedLines);
+            while (lineRoles.size() < wrappedLines.size()) lineRoles.addElement(new Integer(2));
+            while (lineStyles.size() < wrappedLines.size()) lineStyles.addElement(MdLayout.NONE);
+            midlet.bootMark("open failed");
+        } finally {
+            Omega.clearSmall("OmegaGuard");
+        }
+        repaint();
+    }
+
     public void initChatSession(final String cName) {
         chatName = cName;
         currentInput.setLength(0);

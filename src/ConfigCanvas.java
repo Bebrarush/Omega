@@ -294,6 +294,8 @@ class ConfigCanvas extends Canvas {
             
             aboutForm.append(new StringItem("Shortcuts:", "- D-Pad Up / Down: Scroll\n- Fire: Full text input\n- Left Softkey: Chat / Select\n- Right Softkey: Exit / Back\n- Key '0': Delete chat\n"));
 
+            aboutForm.append(new StringItem("\nStart log:", midlet.bootLast() + "\n"));
+
             aboutForm.append(new StringItem("", "\nwith love by bebrauwu <3"));
             Command backCmd = new Command("Back", Command.BACK, 1);
             aboutForm.addCommand(backCmd);

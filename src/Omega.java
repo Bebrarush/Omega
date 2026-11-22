@@ -65,21 +65,73 @@ public static final String[] CHAT_URLS = {
     "https://openrouter.ai/api/v1/chat/completions"
 };
 
+// ===== След запуска: метки этапов лежат в RMS. Если телефон убьёт мидлет по памяти, при следующем запуске видно, где это случилось =====
+
+private static String memStr() {
+    Runtime r = Runtime.getRuntime();
+    return (r.freeMemory() / 1024) + "K free of " + (r.totalMemory() / 1024) + "K";
+}
+
+// Короткая запись целиком в одном хранилище RMS. Нет хранилища: null
+public static String readSmall(String store) {
+    RecordStore rs = null;
+    try {
+        rs = RecordStore.openRecordStore(store, false);
+        if (rs.getNumRecords() > 0) return new String(rs.getRecord(1), "UTF-8");
+    } catch (Exception e) {}
+    finally { if (rs != null) try { rs.closeRecordStore(); } catch (Exception e) {} }
+    return null;
+}
+
+public static void writeSmall(String store, String text) {
+    RecordStore rs = null;
+    try { RecordStore.deleteRecordStore(store); } catch (Exception e) {}
+    try {
+        rs = RecordStore.openRecordStore(store, true);
+        byte[] b = text.getBytes("UTF-8");
+        rs.addRecord(b, 0, b.length);
+    } catch (Exception e) {}
+    finally { if (rs != null) try { rs.closeRecordStore(); } catch (Exception e) {} }
+}
+
+public static void clearSmall(String store) {
+    try { RecordStore.deleteRecordStore(store); } catch (Exception e) {}
+}
+
+// Добавляет метку этапа с остатком памяти; хранятся последние шесть
+public void bootMark(String stage) {
+    String old = readSmall("OmegaBoot");
+    if (old == null) old = "";
+    String all = (old.length() == 0 ? "" : old + "|") + stage + ": " + memStr();
+    int cnt = 0;
+    for (int i = 0; i < all.length(); i++) if (all.charAt(i) == '|') cnt++;
+    while (cnt >= 6) {
+        all = all.substring(all.indexOf('|') + 1);
+        cnt--;
+    }
+    writeSmall("OmegaBoot", all);
+}
+
+public String bootLast() {
+    String s = readSmall("OmegaBoot");
+    return (s == null || s.length() == 0) ? "-" : s.replace('|', '\n');
+}
+
 public Omega() {
     display = Display.getDisplay(this);
+    bootMark("start");
 
     loadTheme();
     boolean hasSettings = loadSettings();
     loadProviderCache(selectedProvider);
+    bootMark("settings");
 
     configCanvas = new ConfigCanvas(this);
     chatCanvas = new TerminalCanvas(this);
     themeCanvas = new ThemeCanvas(this);
     selectCanvas = new CustomSelectCanvas(this);
-
-    if (hasSettings && apiKey.length() > 0) {
-        chatCanvas.initChatSession(currentChat);
-    }
+    bootMark("screens");
+    // Историю чата здесь не грузим: сначала приложение должно дойти до экрана, чат откроется уже там (см. startApp)
 }
 
 protected void startApp() {
@@ -104,8 +156,25 @@ protected void startApp() {
             } catch (Exception e) {}
             finally { if (rs != null) try { rs.closeRecordStore(); } catch (Exception e) {} }
 
+            String guard = readSmall("OmegaGuard");
             if (hasSettings && apiKey.length() > 0) {
-                safeSetCurrent(chatCanvas);
+                if (guard != null && guard.length() > 0) {
+                    // Прошлый запуск оборвался, пока открывался этот чат: сам он не открывается, чтобы приложение хотя бы запустилось
+                    clearSmall("OmegaGuard");
+                    safeSetCurrent(configCanvas);
+                    final String gName = guard;
+                    display.callSerially(new Runnable() {
+                        public void run() {
+                            Alert al = new Alert("Chat not opened", "The last start stopped while opening chat \"" + gName
+                                + "\" (not enough memory?). Pick another chat, or open it again from Chat.\n" + bootLast(), null, AlertType.WARNING);
+                            al.setTimeout(Alert.FOREVER);
+                            display.setCurrent(al, configCanvas);
+                        }
+                    });
+                } else {
+                    safeSetCurrent(chatCanvas);
+                    chatCanvas.loadSoon(currentChat);
+                }
             } else {
                 safeSetCurrent(configCanvas);
             }
@@ -159,8 +228,8 @@ public void openSelectionMenuIf(final int tok, final String title, final Vector 
 public void switchToChat() {
     saveProviderCache();
     saveSettings();
-    chatCanvas.initChatSession(currentChat);
     safeSetCurrent(chatCanvas);
+    chatCanvas.loadSoon(currentChat);
 }
 
 public void switchToConfig() {
